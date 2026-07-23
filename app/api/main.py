@@ -1,0 +1,466 @@
+"""FastAPI microservice exposing the forecasting and surplus-marketing endpoints.
+
+Run:  .venv/bin/uvicorn app.api.main:app --reload
+Docs: http://127.0.0.1:8000/docs
+
+The model is trained once at startup and held in memory. That is fine for a POC and
+wrong for production, where training belongs in a scheduled job writing to a model
+registry -- noted in the plan, deliberately out of scope here.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+from contextlib import asynccontextmanager
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api import schemas
+from app.core.items import BY_SKU
+from app.core.surplus import detect_surplus
+from app.integration import restomind
+from app.integration.registry import RestaurantRegistry
+from app.marketing.copy import OfferService
+from app.marketing.publisher import MetaPublisher
+from app.models.service import ForecastService
+
+STATE: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Prepare the service on startup so the first request is not the one that pays.
+
+    Two start modes, chosen by the COLD_START env var:
+      * default        -- load the full (simulated) history and train, as before. Every
+                          item is already past the threshold, so all use the model.
+      * COLD_START=true -- start with zero history. Every item is rule-based until data
+                          is posted to /data/ingest. This is the cold-start demo path.
+    """
+    service = ForecastService(horizon=1)
+    if os.getenv("COLD_START", "false").lower() == "true":
+        service.start_cold()
+    else:
+        service.train()
+    STATE["forecast"] = service
+    STATE["offers"] = OfferService()
+    STATE["publisher"] = MetaPublisher()
+    # Per-restaurant learned levels. Set REGISTRY_STORE to persist across restarts
+    # (default in-memory, so tests stay isolated).
+    STATE["registry"] = RestaurantRegistry(persist_path=os.getenv("REGISTRY_STORE"))
+    yield
+    STATE.clear()
+
+
+app = FastAPI(
+    title="Bakery Demand & Surplus AI",
+    version="0.1.0",
+    lifespan=lifespan,
+    description=(
+        "Demand forecasting and automated surplus marketing for Egyptian bakeries.\n\n"
+        "**All forecasts in this POC are trained on SIMULATED data.** Figures are "
+        "projections from a generated dataset with assumed unit economics, not "
+        "measurements from a real bakery."
+    ),
+)
+
+# Allow a browser frontend to call the model directly. Wide-open origins are fine for a
+# POC/demo; a real deployment should list the actual frontend domains here instead of "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _service() -> ForecastService:
+    service = STATE.get("forecast")
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Forecast model is still training. Retry shortly.",
+        )
+    return service
+
+
+@app.exception_handler(KeyError)
+async def _key_error_handler(request, exc: KeyError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=schemas.ErrorResponse(
+            error="not_found",
+            detail=str(exc).strip("'\""),
+            hint=f"Known SKUs: {', '.join(sorted(BY_SKU))}",
+        ).model_dump(),
+    )
+
+
+# -- health --------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["ops"])
+def health() -> dict:
+    service = STATE.get("forecast")
+    return {
+        "status": "ok" if service else "training",
+        "model_trained_at": service.trained_at.isoformat() if service and service.trained_at else None,
+        "known_skus": len(BY_SKU),
+        "data_source": "SIMULATED",
+    }
+
+
+# -- data & model lifecycle ----------------------------------------------------------
+
+
+@app.get("/model/status", response_model=schemas.ModelStatusResponse, tags=["lifecycle"])
+def model_status() -> schemas.ModelStatusResponse:
+    """Per-item mode: which items are still rule-based, which use the trained model.
+
+    A new bakery starts fully rule-based; as history accumulates each item promotes to
+    the trained model at the threshold. The frontend can show a progress bar per item
+    from `progress` / `days_until_switch`.
+    """
+    return schemas.ModelStatusResponse(**_service().status())
+
+
+@app.post("/data/ingest", response_model=schemas.IngestResponse, tags=["lifecycle"])
+def ingest(req: schemas.IngestRequest) -> schemas.IngestResponse:
+    """Post end-of-day actuals so history accumulates and items promote to the model.
+
+    This is the endpoint the POS/e-commerce backend calls each night. It updates the
+    rule-based baselines immediately and retrains the model whenever an item reaches the
+    training threshold (default 90 days).
+    """
+    records = pd.DataFrame([r.model_dump() for r in req.records])
+    # leftover_qty is what the pipeline expects; derive it from closing_stock.
+    records["leftover_qty"] = records["closing_stock"]
+    records["is_stockout"] = (
+        (records["sales_qty"] >= records["production_qty"]) & (records["closing_stock"] == 0)
+    ).astype(int)
+    out = _service().ingest(records)
+    return schemas.IngestResponse(**out)
+
+
+# -- forecasting ---------------------------------------------------------------------
+
+
+@app.post("/forecast/daily", response_model=schemas.ForecastResponse, tags=["forecasting"])
+def forecast_daily(req: schemas.DailyForecastRequest) -> schemas.ForecastResponse:
+    """Recommended production quantity for one item on one day."""
+    result = _service().forecast(req.sku, req.date)
+    return schemas.ForecastResponse(
+        sku=result.sku,
+        date=result.date,
+        recommended_quantity=result.quantity,
+        lower_bound=result.lower,
+        upper_bound=result.upper,
+        confidence=result.confidence,
+        source=result.source,
+        factors=[schemas.Factor(**f) for f in result.factors],
+    )
+
+
+@app.post("/forecast/weekly", response_model=schemas.WeeklyForecastResponse, tags=["forecasting"])
+def forecast_weekly(req: schemas.WeeklyForecastRequest) -> schemas.WeeklyForecastResponse:
+    """Seven-day production plan for one item."""
+    results = _service().forecast_week(req.sku, req.start_date)
+    days = [
+        schemas.ForecastResponse(
+            sku=r.sku, date=r.date, recommended_quantity=r.quantity,
+            lower_bound=r.lower, upper_bound=r.upper,
+            confidence=r.confidence, source=r.source,
+            factors=[schemas.Factor(**f) for f in r.factors],
+        )
+        for r in results
+    ]
+    return schemas.WeeklyForecastResponse(
+        sku=req.sku,
+        start_date=req.start_date,
+        total_quantity=sum(d.recommended_quantity for d in days),
+        days=days,
+    )
+
+
+def _to_response(r) -> schemas.ForecastResponse:
+    """Map a service ForecastResult onto the API schema (shared by all forecast routes)."""
+    return schemas.ForecastResponse(
+        sku=r.sku, date=r.date, recommended_quantity=r.quantity,
+        lower_bound=r.lower, upper_bound=r.upper,
+        confidence=r.confidence, source=r.source,
+        factors=[schemas.Factor(**f) for f in r.factors],
+    )
+
+
+@app.post("/forecast/daily-batch", response_model=schemas.DailyBatchResponse, tags=["forecasting"])
+def forecast_daily_batch(req: schemas.DailyBatchRequest) -> schemas.DailyBatchResponse:
+    """Forecast **every item** for one day in a single call.
+
+    This is the endpoint the POS/e-commerce backend should call each morning: one
+    request returns the whole day's production plan, instead of one round-trip per item.
+    Internally the model runs a single pass over all items, so it is also faster than
+    calling `/forecast/daily` in a loop. Pass `skus` to limit to specific items, or omit
+    it for the full catalogue.
+    """
+    results = _service().forecast_all(req.date, req.skus)
+    items = [_to_response(r) for r in results]
+    return schemas.DailyBatchResponse(
+        date=req.date,
+        item_count=len(items),
+        total_quantity=sum(i.recommended_quantity for i in items),
+        items=items,
+    )
+
+
+@app.post("/forecast/weekly-batch", response_model=schemas.WeeklyBatchResponse, tags=["forecasting"])
+def forecast_weekly_batch(req: schemas.WeeklyBatchRequest) -> schemas.WeeklyBatchResponse:
+    """Seven-day production plan for every item, one item's week per entry."""
+    by_sku = _service().forecast_week_all(req.start_date, req.skus)
+    items = [
+        schemas.WeeklyForecastResponse(
+            sku=sku,
+            start_date=req.start_date,
+            total_quantity=sum(r.quantity for r in day_results),
+            days=[_to_response(r) for r in day_results],
+        )
+        for sku, day_results in by_sku.items()
+    ]
+    return schemas.WeeklyBatchResponse(
+        start_date=req.start_date, item_count=len(items), items=items
+    )
+
+
+@app.post(
+    "/forecast/seasonality-adjustment",
+    response_model=schemas.SeasonalityResponse,
+    tags=["forecasting"],
+)
+def seasonality_adjustment(req: schemas.SeasonalityRequest) -> schemas.SeasonalityResponse:
+    """How much does the Egyptian calendar move this item on this date, and why?"""
+    out = _service().seasonality_adjustment(req.sku, req.date)
+    return schemas.SeasonalityResponse(
+        sku=out["sku"], date=out["date"],
+        baseline_quantity=out["baseline_quantity"],
+        adjusted_quantity=out["adjusted_quantity"],
+        multiplier=out["multiplier"],
+        factors=[schemas.Factor(**f) for f in out["factors"]],
+        calendar=schemas.CalendarContext(**out["calendar"]),
+    )
+
+
+# -- waste prevention ----------------------------------------------------------------
+
+
+@app.post("/alerts/waste-prevention", response_model=schemas.WasteAlertResponse, tags=["alerts"])
+def waste_prevention(req: schemas.WasteAlertRequest) -> schemas.WasteAlertResponse:
+    """Warn when a manual production entry exceeds what the model considers plausible.
+
+    Fires against the forecast's *upper bound*, not the point estimate. Alerting on
+    every deviation would train managers to dismiss the system.
+    """
+    out = _service().waste_alert(req.sku, req.date, req.planned_quantity)
+    return schemas.WasteAlertResponse(
+        sku=out["sku"], date=out["date"], planned_qty=out["planned_qty"],
+        forecast_qty=out["forecast_qty"], forecast_upper=out["forecast_upper"],
+        excess_qty=out["excess_qty"], severity=out["severity"], message=out["message"],
+        projected_waste_cost_egp=out["projected_waste_cost_egp"],
+        factors=[schemas.Factor(**f) for f in out["factors"]],
+    )
+
+
+# -- surplus -------------------------------------------------------------------------
+
+
+@app.post("/surplus/detect", response_model=schemas.SurplusResponse, tags=["surplus"])
+def surplus_detect(req: schemas.SurplusRequest) -> schemas.SurplusResponse:
+    """Detect stagnant stock at risk of being wasted tonight."""
+    now = req.timestamp or dt.datetime.now()
+    service = _service()
+
+    daily_forecast = {}
+    for sku in req.stock:
+        try:
+            daily_forecast[sku] = service.forecast(sku, now.date()).quantity
+        except (KeyError, RuntimeError):
+            daily_forecast[sku] = 0.0
+
+    items = detect_surplus(
+        stock=req.stock, daily_forecast=daily_forecast, now=now, close_hour=req.close_hour
+    )
+    return schemas.SurplusResponse(
+        checked_at=now,
+        items_at_risk=[
+            schemas.SurplusItemResponse(
+                sku=i.sku, item_name_ar=i.name_ar, current_stock=i.current_stock,
+                expected_remaining_sales=i.expected_remaining_sales,
+                projected_surplus=i.projected_surplus, risk_score=i.risk_score,
+                urgency=i.urgency, suggested_discount_pct=i.suggested_discount_pct,
+                value_at_risk_egp=i.value_at_risk_egp, hours_to_close=i.hours_to_close,
+            )
+            for i in items
+        ],
+        total_value_at_risk_egp=round(sum(i.value_at_risk_egp for i in items), 2),
+    )
+
+
+# -- marketing -----------------------------------------------------------------------
+
+
+@app.post("/marketing/generate-offer", response_model=schemas.OfferResponse, tags=["marketing"])
+def generate_offer(req: schemas.OfferRequest) -> schemas.OfferResponse:
+    """Generate promotional copy in Egyptian Arabic dialect.
+
+    Uses an LLM when configured and validated, otherwise hand-written templates. The
+    `generator` field reports which one actually produced the text.
+    """
+    offers: OfferService = STATE["offers"]
+    try:
+        offer = offers.build(req.sku, req.discount_pct, req.close_time)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return schemas.OfferResponse(**offer.__dict__)
+
+
+@app.post("/marketing/publish", response_model=schemas.PublishResponse, tags=["marketing"])
+def publish(req: schemas.PublishRequest) -> schemas.PublishResponse:
+    """Publish an offer to Facebook/Instagram.
+
+    Defaults to `dry_run=true`, returning a rendered preview without contacting Meta.
+    Live publishing writes to a real public page under the bakery's brand, so it must
+    be opted into explicitly and requires Meta credentials to be configured.
+    """
+    publisher: MetaPublisher = STATE["publisher"]
+    result = publisher.publish(
+        sku=req.sku, copy_ar=req.copy_ar, platforms=req.platforms, dry_run=req.dry_run
+    )
+    return schemas.PublishResponse(**result)
+
+
+# -- RestoMind integration bridge ----------------------------------------------------
+# Speaks the RestoMind backend's shapes so its Admin/Stores screens can consume model
+# output today, cold-start (rule-based), before sales history exists. See
+# app/integration/restomind.py.
+
+
+@app.post(
+    "/integration/restomind/production-plan",
+    response_model=schemas.RMProductionPlanResponse,
+    tags=["restomind"],
+)
+def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProductionPlanResponse:
+    """Admin screen: how much of each product to make on a date, per restaurant.
+
+    Accepts RestoMind products directly. Runs rule-based (calendar priors by category +
+    owner's `avgDailySales`) since there is no sales history yet, so it works on day one.
+    """
+    products = [
+        restomind.ProductInput(
+            product_id=p.productId, title=p.title, category=p.category,
+            price=p.price, freshness_window=p.freshnessWindow,
+            avg_daily_sales=p.avgDailySales,
+        )
+        for p in req.products
+    ]
+    plan = restomind.production_plan(req.restaurantId, products, req.date)
+    return schemas.RMProductionPlanResponse(
+        restaurantId=req.restaurantId,
+        date=req.date,
+        totalRecommendedQty=sum(i["recommendedQty"] for i in plan),
+        items=[schemas.RMPlanItem(**{**i, "factors": [schemas.Factor(**f) for f in i["factors"]]})
+               for i in plan],
+    )
+
+
+@app.post(
+    "/integration/restomind/surplus-offers",
+    response_model=schemas.RMSurplusResponse,
+    tags=["restomind"],
+)
+def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusResponse:
+    """Stores screen: products at risk near closing, with a discount and Arabic copy."""
+    now = req.timestamp or dt.datetime.now()
+    stock = [
+        restomind.StockInput(
+            product_id=s.productId, title=s.title, category=s.category,
+            price=s.price, freshness_window=s.freshnessWindow,
+            avg_daily_sales=s.avgDailySales, current_stock=s.currentStock,
+        )
+        for s in req.stock
+    ]
+    items = restomind.surplus_offers(req.restaurantId, stock, now, close_hour=req.closeHour)
+    return schemas.RMSurplusResponse(
+        restaurantId=req.restaurantId,
+        checkedAt=now,
+        itemsAtRisk=[schemas.RMSurplusItem(**i) for i in items],
+    )
+
+
+@app.post(
+    "/integration/restomind/predict",
+    response_model=schemas.RMPredictResponse,
+    tags=["restomind"],
+)
+def rm_predict(req: schemas.RMPredictRequest) -> schemas.RMPredictResponse:
+    """Weekly prediction shaped for RestoMind's `predictions` collection.
+
+    This is what their Phase-5 AI pipeline calls: it returns `predictedOrders` for a
+    `targetWeek` plus a `featuresUsed` snapshot, mapping straight onto their prediction
+    document. Rule-based today (cold start); the same contract will serve trained-model
+    output once real sales flow in -- so it is safe to wire now and won't change later.
+    """
+    product = restomind.ProductInput(
+        product_id=req.productId, title=req.title, category=req.category,
+        avg_daily_sales=req.avgDailySales,
+    )
+    # Route through the registry: if this restaurant has ingested enough sales for the
+    # product, the learned level is used; otherwise it falls back to the owner estimate.
+    registry: RestaurantRegistry = STATE["registry"]
+    out = registry.predict_week(
+        req.restaurantId, product, req.targetWeek, promotion_active=req.promotionActive
+    )
+    out["factors"] = [schemas.Factor(**f) for f in out["factors"]]
+    return schemas.RMPredictResponse(**out)
+
+
+@app.post(
+    "/integration/restomind/ingest",
+    response_model=schemas.RMIngestResponse,
+    tags=["restomind"],
+)
+def rm_ingest(req: schemas.RMIngestRequest) -> schemas.RMIngestResponse:
+    """Feed a restaurant's real sales so the bridge learns its demand levels.
+
+    Post RestoMind `sales_transactions` here. Each product's ordinary-day level is
+    re-learned from the data, so subsequent `/predict` calls for that restaurant use the
+    real level instead of the owner's estimate. This is what makes seeding data actually
+    move the prediction.
+    """
+    import pandas as pd
+
+    registry: RestaurantRegistry = STATE["registry"]
+    records = pd.DataFrame([r.model_dump() for r in req.records])
+    records["date"] = records["date"].astype(str)
+    products = [
+        restomind.ProductInput(
+            product_id=p.productId, title=p.title, category=p.category,
+            price=p.price, freshness_window=p.freshnessWindow, avg_daily_sales=p.avgDailySales,
+        )
+        for p in (req.products or [])
+    ]
+    out = registry.ingest(req.restaurantId, records, products or None)
+    return schemas.RMIngestResponse(**out)
+
+
+@app.get(
+    "/integration/restomind/status/{restaurant_id}",
+    response_model=schemas.RMRegistryStatusResponse,
+    tags=["restomind"],
+)
+def rm_registry_status(restaurant_id: str) -> schemas.RMRegistryStatusResponse:
+    """Per-restaurant: which products now use a learned level vs the owner's estimate."""
+    registry: RestaurantRegistry = STATE["registry"]
+    return schemas.RMRegistryStatusResponse(**registry.status(restaurant_id))

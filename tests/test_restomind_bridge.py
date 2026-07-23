@@ -1,0 +1,103 @@
+"""RestoMind integration bridge: accepts their product shapes, returns model output.
+
+Cold-start (rule-based) since no sales history exists yet -- the day-one path for the
+Admin/Stores screens while the backend is still being built.
+"""
+
+from fastapi.testclient import TestClient
+import pytest
+
+from app.api.main import app
+from app.integration.restomind import map_category
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+PRODUCTS = [
+    {"productId": "p1", "title": "كرواسون", "category": "معجنات", "price": 18, "freshnessWindow": 2, "avgDailySales": 180},
+    {"productId": "p2", "title": "كنافة", "category": "حلويات شرقية", "price": 45, "freshnessWindow": 2, "avgDailySales": 40},
+    {"productId": "p3", "title": "عيش فينو", "category": "مخبوزات", "price": 2.5, "freshnessWindow": 1, "avgDailySales": 420},
+]
+
+
+def test_category_mapping_handles_arabic_and_unknown():
+    assert map_category("معجنات") == "pastry"
+    assert map_category("حلويات شرقية") == "sweet"
+    assert map_category("مخبوزات") == "bread"
+    assert map_category("Something Random") == ""   # neutral fallback
+
+
+def test_production_plan_returns_one_row_per_product(client):
+    r = client.post("/integration/restomind/production-plan",
+                    json={"restaurantId": "R1", "date": "2025-02-11", "products": PRODUCTS})
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["items"]) == len(PRODUCTS)
+    assert b["totalRecommendedQty"] == sum(i["recommendedQty"] for i in b["items"])
+    assert all(i["source"] == "rule_based" for i in b["items"])
+
+
+def test_production_plan_applies_ramadan_by_category(client):
+    """Croissant (pastry) must be lower in Ramadan than on a normal day, from priors."""
+    normal = client.post("/integration/restomind/production-plan",
+                         json={"restaurantId": "R1", "date": "2025-02-11", "products": PRODUCTS}).json()
+    ramadan = client.post("/integration/restomind/production-plan",
+                         json={"restaurantId": "R1", "date": "2025-03-15", "products": PRODUCTS}).json()
+    n = {i["title"]: i["recommendedQty"] for i in normal["items"]}
+    rm = {i["title"]: i["recommendedQty"] for i in ramadan["items"]}
+    assert rm["كرواسون"] < n["كرواسون"]     # breakfast pastry falls
+    assert rm["كنافة"] > n["كنافة"]          # Ramadan sweet rises
+
+
+def test_surplus_offers_flags_risk_and_writes_arabic_copy(client):
+    stock = [{**p, "currentStock": cs} for p, cs in zip(PRODUCTS, [40, 25, 150])]
+    r = client.post("/integration/restomind/surplus-offers",
+                    json={"restaurantId": "R1", "stock": stock,
+                          "timestamp": "2025-02-11T19:30:00", "closeHour": 22})
+    assert r.status_code == 200
+    items = r.json()["itemsAtRisk"]
+    assert len(items) > 0
+    for it in items:
+        assert 5 <= it["suggestedDiscountPct"] <= 70
+        assert it["offerCopyAr"] and it["title"] in it["offerCopyAr"]
+        # low-price item must not collapse to "2 بدل 2"
+        assert it["newPrice"] < it.get("price", 9e9) if "price" in it else True
+
+
+def test_surplus_quiet_in_the_morning(client):
+    stock = [{**PRODUCTS[0], "currentStock": 40}]
+    r = client.post("/integration/restomind/surplus-offers",
+                    json={"restaurantId": "R1", "stock": stock,
+                          "timestamp": "2025-02-11T08:00:00", "closeHour": 22})
+    assert r.json()["itemsAtRisk"] == []
+
+
+def test_predict_matches_restomind_prediction_shape(client):
+    """The /predict response must map onto their `predictions` document fields."""
+    r = client.post("/integration/restomind/predict", json={
+        "restaurantId": "R1", "productId": "P42", "title": "كنافة",
+        "category": "حلويات شرقية", "targetWeek": "2025-03-10", "avgDailySales": 40,
+    })
+    assert r.status_code == 200
+    b = r.json()
+    # Fields RestoMind's prediction.model.ts expects.
+    for field in ("restaurantId", "productId", "modelVersionId", "targetWeek",
+                  "predictedOrders", "featuresUsed"):
+        assert field in b
+    assert b["predictedOrders"] > 0
+    assert len(b["dailyBreakdown"]) == 7
+    # Ramadan week -> the calendar snapshot records it, and it drives the number up.
+    assert b["featuresUsed"]["calendar"]["isRamadan"] is True
+    assert any(f["factor"] == "Ramadan" and f["direction"] == "increase" for f in b["factors"])
+
+
+def test_predict_weekly_total_equals_daily_sum(client):
+    r = client.post("/integration/restomind/predict", json={
+        "restaurantId": "R1", "productId": "P1", "title": "كرواسون",
+        "category": "معجنات", "targetWeek": "2025-02-10", "avgDailySales": 180,
+    }).json()
+    assert r["predictedOrders"] == sum(d["qty"] for d in r["dailyBreakdown"])

@@ -1,0 +1,38 @@
+# ── فولدر التجربة مع الباك والفرونت (RestoMind clones) — ما يترفعش ──
+test/
+
+# ── بيئة بايثون الافتراضية ──
+.venv/
+venv/
+env/
+
+# ── ملفات بايثون المؤقتة ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── بيانات مولّدة / حالة وقت التشغيل (بتتولّد تلقائيًا) ──
+data/*.parquet
+data/registry_state.pkl
+data/models/
+# ملاحظة: data/market_priors.json ملف مصدري — بيترفع عادي
+
+# ── أسرار وإعدادات محلية ──
+.env
+.env.*
+!.env.example
+
+# ── سجلات ومؤقتات ──
+*.log
+mongo-data/
+scratchpad/
+
+# ── نظام التشغيل / المحرر ──
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

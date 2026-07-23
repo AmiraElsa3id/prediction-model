@@ -1,0 +1,704 @@
+{
+  "info": {
+    "name": "Bakery Demand & Surplus AI",
+    "_postman_id": "b1a2c3d4-0000-4000-8000-bakeryaidemo01",
+    "description": "مجموعة الـ endpoints بتاعة موديل التنبؤ بالإنتاج وتسويق الفائض للمخابز المصرية.\n\n⚠️ كل الأرقام محاكاة (SIMULATED) — الموديل متدرّب على داتا مولّدة، مش داتا حقيقية من مخبز.\n\n## قبل ما تبدأ\n1. شغّل السيرفر من مجلد المشروع:\n   `.venv/bin/uvicorn app.api.main:app`\n2. استنى رسالة \"Application startup complete\" (حوالي 20 ثانية — الموديل بيتدرّب عند الإقلاع).\n3. الـ baseUrl الافتراضي هو http://127.0.0.1:8000 — تقدر تغيّره من تبويب Variables لو غيّرت البورت.\n\n## الأصناف المتاحة (sku)\nBREAD_BALADI عيش بلدي · BREAD_FINO عيش فينو · PASTRY_CROISSANT كرواسون · PASTRY_DONUT دوناتس · CAKE_GATEAU جاتوه · SWEET_BASBOUSA بسبوسة · SWEET_KONAFA كنافة · SEASONAL_KAHK كحك العيد · SAVOURY_FETEER فطير · SAVOURY_SANDWICH سندوتشات · DRY_PETITFOUR بيتي فور\n\n## نصيحة للتجربة\nجرّب أي صنف في يوم رمضان (زي 2025-03-15) وقارن بيوم عادي (زي 2025-02-11) — هتلاقي الكرواسون بيقل والكنافة بتزيد. دي أهم حاجة الموديل بيعملها.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    },
+    {
+      "key": "ramadanDate",
+      "value": "2025-03-15",
+      "type": "string"
+    },
+    {
+      "key": "normalDate",
+      "value": "2025-02-11",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Health — التأكد إن السيرفر شغّال",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "بيرجّع حالة السيرفر وإذا كان الموديل خلص تدريب. لو status = \"ok\" يبقى جاهز. لو \"training\" استنى شوية.\n\nابدأ بالطلب ده دايمًا قبل أي حاجة تانية."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"السيرفر جاهز (status=ok)\", () => pm.expect(j.status).to.eql(\"ok\"));",
+              "pm.test(\"الموديل خلص تدريب\", () => pm.expect(j.model_trained_at).to.not.be.null);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. Forecast Daily — تنبؤ إنتاج يوم واحد",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"PASTRY_CROISSANT\",\n  \"date\": \"{{ramadanDate}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/forecast/daily",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "forecast",
+            "daily"
+          ]
+        },
+        "description": "بيرجّع الكمية اللي المفروض تنتجها من صنف معيّن في يوم معيّن.\n\n**الإدخال:**\n- `sku`: كود الصنف (من القائمة فوق)\n- `date`: التاريخ بصيغة YYYY-MM-DD\n\n**الإخراج:**\n- `recommended_quantity`: الكمية المقترحة\n- `lower_bound` / `upper_bound`: نطاق الثقة (أقل/أعلى توقع)\n- `confidence`: مستوى الثقة (high/medium/low)\n- `factors`: أسباب الرقم ده (مثلاً \"Ramadan (middle) -50%\") — دي اللي بتخلّي المدير يثق في الرقم\n\n**جرّب:** غيّر التاريخ لـ {{normalDate}} (يوم عادي) وشوف الكمية بتزيد، لأن الكرواسون بيقل في رمضان."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"فيه كمية مقترحة موجبة\", () => pm.expect(j.recommended_quantity).to.be.above(0));",
+              "pm.test(\"الكمية جوه نطاق الثقة\", () => { pm.expect(j.recommended_quantity).to.be.at.least(j.lower_bound); pm.expect(j.recommended_quantity).to.be.at.most(j.upper_bound); });",
+              "pm.test(\"مستوى الثقة قيمة صحيحة\", () => pm.expect([\"high\",\"medium\",\"low\"]).to.include(j.confidence));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "1ب. Forecast Daily Batch — تنبؤ كل الأصناف مرة واحدة ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"date\": \"{{ramadanDate}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/forecast/daily-batch",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "forecast",
+            "daily-batch"
+          ]
+        },
+        "description": "⭐ ده الـ endpoint الأنسب للتكامل مع نظام الـ POS.\n\nبيرجّع توقّع الإنتاج لـ **كل الأصناف** في يوم واحد بطلب واحد — بدل ما تبعت 11 طلب منفصل. وأسرع كمان لأن الموديل بيشتغل مرة واحدة على كل الأصناف (أسرع ~6 مرات من الحلقة).\n\n**الإدخال:**\n- `date`: التاريخ (مطلوب)\n- `skus`: قائمة أصناف معيّنة (اختياري) — سيبها فاضية عشان تجيب كل الأصناف\n\n**الإخراج:**\n- `item_count`: عدد الأصناف\n- `total_quantity`: إجمالي الإنتاج المقترح لكل الأصناف\n- `items`: قائمة، كل عنصر فيها نفس شكل رد forecast/daily (كمية + نطاق + أسباب)\n\n**مثال للأصناف المحددة:** `{ \"date\": \"2025-03-15\", \"skus\": [\"SWEET_KONAFA\", \"CAKE_GATEAU\"] }`"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"رجّع كل الأصناف (11)\", () => pm.expect(j.item_count).to.eql(11));",
+              "pm.test(\"الإجمالي = مجموع الأصناف\", () => { let s = j.items.reduce((a,i)=>a+i.recommended_quantity,0); pm.expect(j.total_quantity).to.eql(s); });",
+              "pm.test(\"كل صنف ليه كمية ونطاق\", () => j.items.forEach(i => { pm.expect(i.recommended_quantity).to.be.at.least(i.lower_bound); pm.expect(i.recommended_quantity).to.be.at.most(i.upper_bound); }));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Forecast Weekly — خطة إنتاج أسبوع",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"CAKE_GATEAU\",\n  \"start_date\": \"2025-03-10\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/forecast/weekly",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "forecast",
+            "weekly"
+          ]
+        },
+        "description": "خطة إنتاج لـ 7 أيام من الصنف المحدّد.\n\n**الإدخال:**\n- `sku`: كود الصنف\n- `start_date`: أول يوم في الأسبوع\n\n**الإخراج:**\n- `total_quantity`: إجمالي كمية الأسبوع\n- `days`: قائمة فيها توقّع كل يوم (نفس شكل forecast/daily)"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"7 أيام بالظبط\", () => pm.expect(j.days).to.have.lengthOf(7));",
+              "pm.test(\"الإجمالي = مجموع الأيام\", () => { let s = j.days.reduce((a,d)=>a+d.recommended_quantity,0); pm.expect(j.total_quantity).to.eql(s); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2ب. Forecast Weekly Batch — خطة أسبوع لكل الأصناف",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"start_date\": \"2025-03-10\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/forecast/weekly-batch",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "forecast",
+            "weekly-batch"
+          ]
+        },
+        "description": "خطة إنتاج 7 أيام لـ **كل الأصناف** في طلب واحد.\n\n**الإدخال:**\n- `start_date`: أول يوم في الأسبوع (مطلوب)\n- `skus`: أصناف معيّنة (اختياري) — سيبها فاضية لكل الأصناف\n\n**الإخراج:**\n- `items`: قائمة، كل عنصر فيه خطة أسبوع لصنف (total_quantity + 7 أيام)"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"رجّع أصناف\", () => pm.expect(j.item_count).to.be.above(0));",
+              "pm.test(\"كل صنف فيه 7 أيام\", () => j.items.forEach(it => pm.expect(it.days).to.have.lengthOf(7)));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Seasonality Adjustment — أثر المناسبات على يوم",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"SWEET_KONAFA\",\n  \"date\": \"{{ramadanDate}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/forecast/seasonality-adjustment",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "forecast",
+            "seasonality-adjustment"
+          ]
+        },
+        "description": "بيوضّح قد إيه التقويم المصري (رمضان/عيد/إجازات) بيغيّر الطلب على صنف في يوم معيّن، ويشرح السبب.\n\n**الإخراج:**\n- `baseline_quantity`: الكمية في يوم عادي من غير مناسبات\n- `adjusted_quantity`: الكمية المعدّلة للتاريخ ده\n- `multiplier`: المُضاعِف (مثلاً 3.0 يعني الطلب 3 أضعاف)\n- `factors`: تفصيل الأسباب\n- `calendar`: معلومات التقويم لليوم ده (رمضان؟ إجازة؟ عطلة أسبوعية؟)\n\n**جرّب:** الكنافة في رمضان multiplier بيبقى أعلى من 2."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"فيه مُضاعِف موجب\", () => pm.expect(j.multiplier).to.be.above(0));",
+              "pm.test(\"معلومات التقويم موجودة\", () => pm.expect(j.calendar).to.have.property(\"is_ramadan\"));",
+              "// الكنافة في رمضان لازم طلبها يزيد (multiplier > 1)",
+              "if (j.calendar.is_ramadan) { pm.test(\"رمضان بيزوّد طلب الكنافة\", () => pm.expect(j.multiplier).to.be.above(1)); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Waste Prevention Alert — تنبيه الهدر",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"PASTRY_CROISSANT\",\n  \"date\": \"{{normalDate}}\",\n  \"planned_quantity\": 600\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/alerts/waste-prevention",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "alerts",
+            "waste-prevention"
+          ]
+        },
+        "description": "بيقارن الكمية اللي المدير كتبها بتوقّع الموديل، ويحذّر لو الرقم أكبر من اللازم — ويقولك هتخسر كام جنيه هدر.\n\n**الإدخال:**\n- `planned_quantity`: الكمية اللي المدير عايز ينتجها\n\n**الإخراج:**\n- `severity`: خطورة التنبيه (none/low/medium/high)\n- `forecast_qty` / `forecast_upper`: توقّع الموديل والحد الأعلى المعقول\n- `excess_qty`: الزيادة عن المعقول\n- `projected_waste_cost_egp`: تكلفة الهدر المتوقّعة بالجنيه\n\n**ملاحظة:** التنبيه بيشتغل بس لما الرقم يتعدّى الحد الأعلى للتوقّع — مش أي زيادة بسيطة. جرّب رقم صغير (زي 100) وهتلاقي severity = none."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"درجة الخطورة قيمة صحيحة\", () => pm.expect([\"none\",\"low\",\"medium\",\"high\"]).to.include(j.severity));",
+              "// المثال بيبعت كمية مبالغ فيها، فالمفروض يطلع تنبيه بتكلفة هدر",
+              "pm.test(\"التنبيه اشتغل والهدر اتحسب\", () => { pm.expect(j.excess_qty).to.be.above(0); pm.expect(j.projected_waste_cost_egp).to.be.above(0); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Surplus Detect — كشف الفائض قرب القفل",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"stock\": {\n    \"CAKE_GATEAU\": 45,\n    \"PASTRY_CROISSANT\": 30,\n    \"SWEET_KONAFA\": 20,\n    \"BREAD_BALADI\": 200\n  },\n  \"timestamp\": \"2025-02-18T19:30:00\",\n  \"close_hour\": 22\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/surplus/detect",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "surplus",
+            "detect"
+          ]
+        },
+        "description": "بياخد المخزون الحالي قرب معاد القفل، ويكتشف الأصناف اللي في خطر إنها تتهدر، ويقترح نسبة خصم لكل واحد.\n\n**الإدخال:**\n- `stock`: المخزون الحالي لكل صنف {sku: عدد}\n- `timestamp`: وقت الفحص (المفروض قرب القفل). لو سبته null بياخد الوقت الحالي\n- `close_hour`: ساعة قفل الفرع (بنظام 24)\n\n**الإخراج:**\n- `items_at_risk`: الأصناف المعرّضة للهدر، مرتّبة بالقيمة\n- لكل صنف: `suggested_discount_pct` (الخصم المقترح)، `urgency`، `value_at_risk_egp`\n- `total_value_at_risk_egp`: إجمالي القيمة المعرّضة للخطر\n\n**جرّب:** غيّر الوقت لـ 08:00 الصبح — مش هيطلع أي حاجة، لأن لسه اليوم كله قدامك تبيع فيه."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"رجّع قائمة أصناف في خطر\", () => pm.expect(j.items_at_risk).to.be.an(\"array\"));",
+              "pm.test(\"فيه قيمة معرّضة للخطر\", () => pm.expect(j.total_value_at_risk_egp).to.be.above(0));",
+              "// كل صنف مقترح ليه خصم منطقي بين 5 و 70",
+              "j.items_at_risk.forEach(it => { pm.test(`خصم منطقي لـ ${it.sku}`, () => { pm.expect(it.suggested_discount_pct).to.be.within(5,70); }); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Generate Offer — كتابة عرض بالعامية المصرية",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"CAKE_GATEAU\",\n  \"discount_pct\": 30,\n  \"close_time\": \"10 بالليل\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/marketing/generate-offer",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "marketing",
+            "generate-offer"
+          ]
+        },
+        "description": "بيكتب إعلان ترويجي بالعامية المصرية للصنف والخصم المحدّد.\n\n**الإدخال:**\n- `sku`: كود الصنف\n- `discount_pct`: نسبة الخصم (من 5 لـ 70)\n- `close_time`: معاد انتهاء العرض (نص حر)\n\n**الإخراج:**\n- `copy_ar`: نص الإعلان بالعامية\n- `old_price` / `new_price`: السعر قبل وبعد الخصم\n- `generator`: مين كتب النص — \"llm\" (لو فيه مفتاح API) أو \"template\" (قوالب جاهزة)\n- `hashtags`: هاشتاجات مقترحة\n\n**ملاحظة:** من غير مفتاح LLM بيستخدم قوالب جاهزة مكتوبة بالعامية. لتفعيل الـ LLM المجاني، حط المتغيرات LLM_API_KEY وLLM_BASE_URL قبل تشغيل السيرفر."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"النص فيه حروف عربية\", () => pm.expect(j.copy_ar).to.match(/[\\u0600-\\u06FF]/));",
+              "pm.test(\"السعر الجديد أقل من القديم\", () => pm.expect(j.new_price).to.be.below(j.old_price));",
+              "pm.test(\"اتكتب بـ llm أو template\", () => pm.expect([\"llm\",\"template\"]).to.include(j.generator));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Publish (dry-run) — معاينة النشر على فيسبوك/انستجرام",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sku\": \"CAKE_GATEAU\",\n  \"copy_ar\": \"عرض النهاردة بس! 🎉 جاتوه بخصم 30% لحد 10 بالليل. لحق نفسك!\",\n  \"platforms\": [\"facebook\", \"instagram\"],\n  \"dry_run\": true\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/marketing/publish",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "marketing",
+            "publish"
+          ]
+        },
+        "description": "بينشر العرض على فيسبوك/انستجرام.\n\n⚠️ افتراضيًا `dry_run: true` — يعني بيرجّع معاينة بس من غير ما يبعت حاجة فعليًا لـ Meta. ده مقصود: النشر الحقيقي بيروح على صفحة عامة باسم المخبز وميتلغيش.\n\n**الإدخال:**\n- `copy_ar`: نص الإعلان (خده من endpoint رقم 6)\n- `platforms`: [\"facebook\"] و/أو [\"instagram\"]\n- `dry_run`: خليها true للمعاينة\n\n**الإخراج:**\n- `status`: \"preview\" في وضع المعاينة\n- `preview`: شكل البوست على كل منصة\n\nللنشر الحقيقي لازم 3 حاجات مع بعض: متغيرات Meta (META_PAGE_ID + META_ACCESS_TOKEN)، وMETA_PUBLISH_ENABLED=true، و`dry_run: false`. من غير كده بيرجّع معاينة أو رسالة خطأ واضحة."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "// dry_run=true فالمفروض معاينة بس من غير نشر فعلي",
+              "pm.test(\"وضع المعاينة (مفيش نشر فعلي)\", () => { pm.expect(j.status).to.eql(\"preview\"); pm.expect(j.dry_run).to.be.true; });",
+              "pm.test(\"مفيش IDs بوستات لأنه معاينة\", () => pm.expect(Object.keys(j.post_ids)).to.have.lengthOf(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Model Status — حالة كل صنف (قواعد ولا موديل) ⭐",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/model/status",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "model",
+            "status"
+          ]
+        },
+        "description": "بيوضّح كل صنف شغّال بإيه: `rule_based` (قواعد، مخبز لسه جديد) ولا `trained_model` (اتدرّب على 90 يوم+).\n\nلكل صنف: `observed_days` (عدد الأيام المتجمّعة)، `days_until_switch` (فاضل كام يوم للتحويل)، و`progress` (نسبة التقدّم). مفيد تعمل بيه progress bar في الفرونت.\n\n**الفكرة:** المخبز بيبدأ كله قواعد، وكل صنف يتحوّل للموديل لوحده لما يجمّع 90 يوم بيانات."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"فيه حد تدريب\", () => pm.expect(j.train_threshold_days).to.be.above(0));",
+              "pm.test(\"مجموع الأصناف صح\", () => pm.expect(j.items.length).to.eql(j.items_rule_based + j.items_trained));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. Data Ingest — إدخال مبيعات آخر اليوم ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"records\": [\n    {\n      \"date\": \"2025-07-20\",\n      \"sku\": \"BREAD_BALADI\",\n      \"sales_qty\": 1150,\n      \"production_qty\": 1300,\n      \"closing_stock\": 150\n    },\n    {\n      \"date\": \"2025-07-20\",\n      \"sku\": \"CAKE_GATEAU\",\n      \"sales_qty\": 80,\n      \"production_qty\": 95,\n      \"closing_stock\": 15\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/data/ingest",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "data",
+            "ingest"
+          ]
+        },
+        "description": "⭐ ده اللي بيخلّي الموديل يتعلّم. الباك اند بينده الـ endpoint ده كل يوم بمبيعات اليوم الفعلية.\n\n**لكل سجل:**\n- `date`, `sku`\n- `sales_qty`: المبيعات الفعلية\n- `production_qty`: الكمية المنتَجة\n- `closing_stock`: المتبقّي آخر اليوم (الهدر)\n\n**الإخراج:**\n- `model_retrained`: هل صنف عدّى حد التدريب؟\n- `newly_switched_to_ml`: الأصناف اللي اتحوّلت للموديل\n- `total_days_by_item`: عدد الأيام المتجمّعة لكل صنف\n\n**الفكرة:** لما صنف يوصل 90 يوم، بيتحوّل تلقائيًا من القواعد للموديل المدرَّب."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"اتسجّلت السجلات\", () => pm.expect(j.rows_ingested).to.be.above(0));",
+              "pm.test(\"فيه عدّاد أيام لكل صنف\", () => pm.expect(j.total_days_by_item).to.be.an(\"object\"));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Model Status — حالة كل صنف (قواعد/موديل) ⭐",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/model/status",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "model",
+            "status"
+          ]
+        },
+        "description": "بيوضّح كل صنف شغّال بقواعد (rule_based) ولا موديل مدرَّب (trained_model)، وكل صنف فاضله كام يوم للتحويل (90 يوم). مفيد لـ progress bar في الأدمن."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
+              "let j=pm.response.json();",
+              "pm.test(\"مجموع الأصناف صح\",()=>pm.expect(j.items.length).to.eql(j.items_rule_based+j.items_trained));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Data Ingest — إدخال مبيعات اليوم (الموديل بيتعلّم) ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/data/ingest",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "data",
+            "ingest"
+          ]
+        },
+        "description": "الباك بينده ده كل ليلة بمبيعات اليوم. لما صنف يوصل 90 يوم بيتحوّل تلقائيًا للموديل المدرَّب. `newly_switched_to_ml` بيقولك مين اتحوّل.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"records\": [\n    {\"date\":\"2025-07-20\",\"sku\":\"BREAD_BALADI\",\"sales_qty\":1150,\"production_qty\":1300,\"closing_stock\":150},\n    {\"date\":\"2025-07-20\",\"sku\":\"CAKE_GATEAU\",\"sales_qty\":80,\"production_qty\":95,\"closing_stock\":15}\n  ]\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
+              "let j=pm.response.json();",
+              "pm.test(\"اتسجّلت\",()=>pm.expect(j.rows_ingested).to.be.above(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12. RestoMind — خطة إنتاج (الأدمن) ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/integration/restomind/production-plan",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "integration",
+            "restomind",
+            "production-plan"
+          ]
+        },
+        "description": "جسر RestoMind — بياخد منتجاتكم بشكلها الحقيقي (productId, category, freshnessWindow) ويرجّع كمية الإنتاج لكل منتج. rule-based (cold-start) لحد ما تيجي داتا مبيعات.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"date\":\"{{ramadanDate}}\",\n  \"products\":[\n    {\"productId\":\"p1\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"freshnessWindow\":2,\"avgDailySales\":180},\n    {\"productId\":\"p2\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"freshnessWindow\":2,\"avgDailySales\":40}\n  ]\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
+              "let j=pm.response.json();",
+              "pm.test(\"منتج لكل صنف\",()=>pm.expect(j.items.length).to.eql(2));",
+              "pm.test(\"إجمالي = مجموع\",()=>pm.expect(j.totalRecommendedQty).to.eql(j.items.reduce((a,i)=>a+i.recommendedQty,0)));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "13. RestoMind — فائض + عروض (الستورز) ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/integration/restomind/surplus-offers",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "integration",
+            "restomind",
+            "surplus-offers"
+          ]
+        },
+        "description": "جسر RestoMind — المنتجات المعرّضة للهدر قرب القفل + خصم مقترح + إعلان بالعامية. جرّب الوقت 08:00 الصبح مش هيطلع حاجة.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"timestamp\":\"{{ramadanDate}}T19:30:00\",\n  \"closeHour\":22,\n  \"stock\":[\n    {\"productId\":\"p1\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"freshnessWindow\":2,\"avgDailySales\":180,\"currentStock\":40},\n    {\"productId\":\"p2\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"freshnessWindow\":2,\"avgDailySales\":40,\"currentStock\":25}\n  ]\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
+              "let j=pm.response.json();",
+              "pm.test(\"رجّع مصفوفة\",()=>pm.expect(j.itemsAtRisk).to.be.an(\"array\"));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "14. RestoMind — تنبؤ أسبوعي (predictions) ⭐",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/integration/restomind/predict",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "integration",
+            "restomind",
+            "predict"
+          ]
+        },
+        "description": "بيطابق مجموعة `predictions` بتاعت RestoMind: بيرجّع `predictedOrders` أسبوعي + `featuresUsed` (بتتخزّن للمراجعة) + الأسباب. غيّر targetWeek ليوم عادي وشوف الرقم بيقل (رمضان بيرفع الكنافة).",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"productId\":\"665f0a1b2c3d4e5f00000042\",\n  \"title\":\"كنافة\",\n  \"category\":\"حلويات شرقية\",\n  \"targetWeek\":\"2025-03-10\",\n  \"avgDailySales\":40\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
+              "let j=pm.response.json();",
+              "pm.test(\"شكل predictions\",()=>{[\"restaurantId\",\"productId\",\"modelVersionId\",\"targetWeek\",\"predictedOrders\",\"featuresUsed\"].forEach(f=>pm.expect(j).to.have.property(f));});",
+              "pm.test(\"7 أيام\",()=>pm.expect(j.dailyBreakdown).to.have.lengthOf(7));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

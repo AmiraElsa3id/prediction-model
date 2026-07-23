@@ -1,0 +1,82 @@
+"""Per-restaurant registry: seeding real sales must change predictions, per tenant."""
+
+import datetime as dt
+
+from fastapi.testclient import TestClient
+import pytest
+
+from app.api.main import app
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def _sales(product_id, n, level, start="2025-01-01"):
+    import random
+    rng = random.Random(7)
+    d0 = dt.date.fromisoformat(start)
+    return [{"date": (d0 + dt.timedelta(days=i)).isoformat(),
+             "productId": product_id, "salesQty": rng.randint(level - 12, level + 12)}
+            for i in range(n)]
+
+
+def test_seeding_sales_changes_the_prediction(client):
+    rid, pid = "REG_R1", "REG_P1"
+    prod = {"restaurantId": rid, "productId": pid, "title": "كرواسون",
+            "category": "معجنات", "avgDailySales": 180, "targetWeek": "2025-02-10"}
+
+    before = client.post("/integration/restomind/predict", json=prod).json()
+    assert before["featuresUsed"]["levelSource"] == "owner_estimate"
+
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": rid, "records": _sales(pid, 30, 110),
+        "products": [{"productId": pid, "title": "كرواسون", "category": "معجنات"}],
+    })
+
+    after = client.post("/integration/restomind/predict", json=prod).json()
+    assert after["featuresUsed"]["levelSource"] == "learned_from_sales"
+    assert after["predictedOrders"] < before["predictedOrders"]  # learned 110 < guess 180
+
+
+def test_registry_is_per_tenant(client):
+    """Restaurant A's data must not leak into restaurant B."""
+    pid = "SHARED_P"
+    prod = {"productId": pid, "title": "كنافة", "category": "حلويات شرقية",
+            "avgDailySales": 40, "targetWeek": "2025-02-10"}
+
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": "REG_A", "records": _sales(pid, 30, 200),
+        "products": [{"productId": pid, "title": "كنافة", "category": "حلويات شرقية"}],
+    })
+    a = client.post("/integration/restomind/predict", json={"restaurantId": "REG_A", **prod}).json()
+    b = client.post("/integration/restomind/predict", json={"restaurantId": "REG_B", **prod}).json()
+
+    assert a["featuresUsed"]["levelSource"] == "learned_from_sales"
+    assert b["featuresUsed"]["levelSource"] == "owner_estimate"   # B never got data
+    assert a["predictedOrders"] != b["predictedOrders"]
+
+
+def test_too_little_data_keeps_owner_estimate(client):
+    rid, pid = "REG_R3", "REG_P3"
+    prod = {"restaurantId": rid, "productId": pid, "title": "دوناتس",
+            "category": "معجنات", "avgDailySales": 100, "targetWeek": "2025-02-10"}
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": rid, "records": _sales(pid, 5, 60),   # below MIN_DAYS_FOR_LEARNED
+        "products": [{"productId": pid, "title": "دوناتس", "category": "معجنات"}],
+    })
+    after = client.post("/integration/restomind/predict", json=prod).json()
+    assert after["featuresUsed"]["levelSource"] == "owner_estimate"
+
+
+def test_registry_status_reports_learned_products(client):
+    rid, pid = "REG_R4", "REG_P4"
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": rid, "records": _sales(pid, 30, 90),
+        "products": [{"productId": pid, "title": "فطير", "category": "مالح"}],
+    })
+    st = client.get(f"/integration/restomind/status/{rid}").json()
+    assert st["usingLearnedLevel"] == 1
+    assert st["items"][0]["learnedLevel"] is not None

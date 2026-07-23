@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "source": "LLM market analysis (Claude) for Egyptian bakeries/restaurants",
+    "note": "Educated estimates of CALENDAR SENSITIVITY, not measured data. They seed the rule-based cold start and are corrected by real sales over the first ~90 days. Absolute daily levels are NOT here -- those come from onboarding per restaurant.",
+    "events": ["weekend", "ramadan", "ramadan_late", "eid", "kahk_peak", "school", "payday", "sham_el_nessim", "holiday"]
+  },
+  "categories": {
+    "bread":    { "weekend": 1.10, "ramadan": 1.12, "school": 1.05, "payday": 1.03, "holiday": 1.05 },
+    "pastry":   { "weekend": 1.35, "ramadan": 0.50, "eid": 1.10, "school": 1.20, "payday": 1.12, "holiday": 1.15 },
+    "cake":     { "weekend": 1.50, "ramadan": 1.70, "ramadan_late": 1.20, "eid": 2.00, "payday": 1.25, "holiday": 1.40 },
+    "sweet":    { "weekend": 1.25, "ramadan": 2.50, "ramadan_late": 1.25, "eid": 1.70, "payday": 1.10, "holiday": 1.25 },
+    "savoury":  { "weekend": 1.40, "ramadan": 1.00, "school": 1.30, "payday": 1.10, "sham_el_nessim": 2.00, "holiday": 1.30 },
+    "seasonal": { "eid": 6.00, "kahk_peak": 45.00 },
+    "dry":      { "weekend": 1.25, "ramadan": 1.40, "eid": 3.00, "payday": 1.20, "holiday": 1.50 }
+  },
+  "item_overrides": {
+    "SWEET_KONAFA":     { "ramadan": 4.50, "reason": "الكنافة صنف رمضاني بامتياز، الطلب بيتضاعف كتير" },
+    "SAVOURY_FETEER":   { "weekend": 1.60, "sham_el_nessim": 3.20, "reason": "الفطير مع الفسيخ في شم النسيم، وإقبال عالي في الويكند" },
+    "SAVOURY_SANDWICH": { "weekend": 0.70, "ramadan": 0.30, "school": 1.55, "reason": "سندوتشات المدارس: بتقل في الويكند ورمضان، وبتزيد في أيام الدراسة" },
+    "SWEET_BASBOUSA":   { "ramadan": 2.05, "reason": "حلو شرقي رمضاني" },
+    "CAKE_GATEAU":      { "eid": 2.10, "reason": "الجاتوه إقبال عالي في العيد والمناسبات" },
+    "SEASONAL_KAHK":    { "kahk_peak": 45.00, "eid": 6.00, "reason": "كحك العيد موسمي بحت، الذروة في العشر أيام قبل عيد الفطر" }
+  }
+}
