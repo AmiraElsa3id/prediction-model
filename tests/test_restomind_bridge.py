@@ -101,3 +101,38 @@ def test_predict_weekly_total_equals_daily_sum(client):
         "category": "معجنات", "targetWeek": "2025-02-10", "avgDailySales": 180,
     }).json()
     assert r["predictedOrders"] == sum(d["qty"] for d in r["dailyBreakdown"])
+
+
+def test_zero_avg_daily_sales_is_respected_not_replaced_by_default():
+    """avgDailySales=0 means 'sells nothing', not 'no estimate given'."""
+    from app.core.egypt_calendar import CALENDAR
+    from app.integration.restomind import DEFAULT_DAILY_LEVEL, ProductInput, _forecast_one
+    import datetime as dt
+
+    feats = CALENDAR.features(dt.date(2025, 2, 11))
+    zero = ProductInput(product_id="p0", title="Dead SKU", category="bread", avg_daily_sales=0.0)
+    qty, _ = _forecast_one(zero, feats)
+    assert qty == 0.0
+
+    # None means "no estimate given" -> the default level is substituted, so it
+    # must forecast identically to a product that explicitly states that level.
+    unknown = ProductInput(product_id="p1", title="New SKU", category="bread", avg_daily_sales=None)
+    explicit_default = ProductInput(
+        product_id="p1b", title="New SKU", category="bread",
+        avg_daily_sales=DEFAULT_DAILY_LEVEL,
+    )
+    qty_unknown, _ = _forecast_one(unknown, feats)
+    qty_explicit, _ = _forecast_one(explicit_default, feats)
+    assert qty_unknown > 0
+    assert qty_unknown == qty_explicit
+
+
+def test_fractional_avg_daily_sales_is_preserved():
+    from app.core.egypt_calendar import CALENDAR
+    from app.integration.restomind import ProductInput, _forecast_one
+    import datetime as dt
+
+    feats = CALENDAR.features(dt.date(2025, 2, 11))
+    low = ProductInput(product_id="p2", title="Slow SKU", category="bread", avg_daily_sales=0.43)
+    qty, _ = _forecast_one(low, feats)
+    assert 0 < qty < 5

@@ -109,8 +109,11 @@ def _forecast_one(
     mult, factors = rule_multiplier(priors, feats)
     if level is not None:
         base = level
+    elif p.avg_daily_sales is not None:
+        # 0.0 is a real answer ("this product sells nothing"), not a missing value.
+        base = p.avg_daily_sales
     else:
-        base = p.avg_daily_sales if p.avg_daily_sales else DEFAULT_DAILY_LEVEL
+        base = DEFAULT_DAILY_LEVEL
     return base * mult, factors
 
 
