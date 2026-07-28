@@ -136,3 +136,28 @@ def test_fractional_avg_daily_sales_is_preserved():
     low = ProductInput(product_id="p2", title="Slow SKU", category="bread", avg_daily_sales=0.43)
     qty, _ = _forecast_one(low, feats)
     assert 0 < qty < 5
+
+
+def test_predict_daily_breakdown_uses_predicted_quantity_key(client):
+    r = client.post("/integration/restomind/predict",
+                    json={"restaurantId": "R1", "productId": "p1", "title": "كرواسون",
+                          "category": "معجنات", "targetWeek": "2025-03-09",
+                          "avgDailySales": 180})
+    assert r.status_code == 200
+    b = r.json()
+    assert len(b["dailyBreakdown"]) == 7
+    for day in b["dailyBreakdown"]:
+        assert "predictedQuantity" in day, "consumer reads predictedQuantity"
+        assert day["predictedQuantity"] == day["qty"], "qty kept as deprecated alias"
+    # The weekly total must reconcile with the daily rows.
+    assert b["predictedOrders"] == sum(d["predictedQuantity"] for d in b["dailyBreakdown"])
+
+
+def test_predict_daily_breakdown_is_not_flat_across_ramadan(client):
+    """A week spanning Ramadan must vary day to day, not be a flat average."""
+    r = client.post("/integration/restomind/predict",
+                    json={"restaurantId": "R1", "productId": "p1", "title": "كرواسون",
+                          "category": "معجنات", "targetWeek": "2025-02-27",
+                          "avgDailySales": 180})
+    qtys = [d["predictedQuantity"] for d in r.json()["dailyBreakdown"]]
+    assert len(set(qtys)) > 1, "calendar signal must survive into the daily rows"

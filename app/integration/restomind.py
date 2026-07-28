@@ -161,13 +161,18 @@ def predict_week(
         d = week_start + dt.timedelta(days=i)
         feats = CALENDAR.features(d)
         qty, factors = _forecast_one(product, feats, level=level)
+        rounded = int(round(max(qty, 0)))
         daily.append({
             "date": d.isoformat(),
-            "qty": int(round(max(qty, 0))),
+            # `predictedQuantity` is the canonical name -- it matches RestoMind's
+            # DailyBreakdownItem schema, which is what consumes this array.
+            "predictedQuantity": rounded,
+            # DEPRECATED alias, kept one release so existing clients do not break.
+            "qty": rounded,
             "factors": factors,
         })
     # Sum the rounded daily values so the weekly total always reconciles with the breakdown.
-    total = sum(day["qty"] for day in daily)
+    total = sum(day["predictedQuantity"] for day in daily)
 
     # Feature snapshot -- what actually fed the prediction, for auditability.
     week_feats = CALENDAR.features(week_start)
