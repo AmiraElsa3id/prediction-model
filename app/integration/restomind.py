@@ -180,7 +180,9 @@ def predict_week(
         "modelVersion": MODEL_VERSION,
         "mode": mode,
         "baseDailyLevel": round(
-            level if level is not None else (product.avg_daily_sales or DEFAULT_DAILY_LEVEL), 2
+            level if level is not None
+            else (product.avg_daily_sales if product.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL),
+            2,
         ),
         "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
         "categoryResolved": map_category(product.category) or "neutral",

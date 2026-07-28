@@ -161,3 +161,15 @@ def test_predict_daily_breakdown_is_not_flat_across_ramadan(client):
                           "avgDailySales": 180})
     qtys = [d["predictedQuantity"] for d in r.json()["dailyBreakdown"]]
     assert len(set(qtys)) > 1, "calendar signal must survive into the daily rows"
+
+
+def test_predict_week_zero_avg_daily_sales_reports_true_base_level(client):
+    """avgDailySales=0 means 'sells nothing' -- featuresUsed.baseDailyLevel must reflect
+    that, not silently fall back to DEFAULT_DAILY_LEVEL (40)."""
+    r = client.post("/integration/restomind/predict", json={
+        "restaurantId": "R1", "productId": "p0", "title": "Dead SKU",
+        "category": "bread", "targetWeek": "2025-02-10", "avgDailySales": 0,
+    })
+    assert r.status_code == 200
+    b = r.json()
+    assert b["featuresUsed"]["baseDailyLevel"] == 0
