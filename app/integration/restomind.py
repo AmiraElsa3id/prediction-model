@@ -21,12 +21,17 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
 from app.core.market_priors import category_priors
 from app.core.surplus import SELL_THROUGH_CURVE, expected_sell_through
 from app.marketing.copy import OfferService
 from app.models.rule_based import rule_multiplier
+
+# Every wall-clock quantity this bridge reasons about -- `close_hour`, the
+# sell-through curve's hour index, the calendar's date -- is Cairo local time.
+BUSINESS_TIMEZONE = ZoneInfo("Africa/Cairo")
 
 # Fallback daily level when the owner gives no estimate for a product.
 DEFAULT_DAILY_LEVEL = 40.0
@@ -225,6 +230,30 @@ class StockInput(ProductInput):
     current_stock: int = 0
 
 
+def to_business_time(now: dt.datetime) -> dt.datetime:
+    """Reduce any instant to Cairo wall-clock time, as a naive datetime.
+
+    `close_hour` is a *Cairo* wall-clock hour (22 = 10pm local), and so are the
+    hour index of the sell-through curve and the date the Egyptian calendar is
+    keyed on. The RestoMind backend sends an offset-aware UTC timestamp
+    (`new Date().toISOString()`), which Pydantic faithfully parses as UTC -- so
+    reading `.hour` off it compared a UTC hour against a Cairo one. In summer
+    (UTC+3) that is a three-hour error in the wrong direction: at Cairo 22:30,
+    actual closing time, `.hour` read 19, the curve still expected 9% more
+    sell-through, and `hours_left` claimed 2.5 hours remained. The scan
+    systematically under-flagged surplus at exactly the moment it exists to run.
+    `.date()` was wrong too, between Cairo 00:00 and 03:00, which mis-keys the
+    holiday/Ramadan calendar features.
+
+    A naive datetime is taken to already be Cairo wall-clock and passed through
+    unchanged -- there is no offset to reason about, and that is the shape the
+    bridge's own callers and tests use.
+    """
+    if now.tzinfo is None:
+        return now
+    return now.astimezone(BUSINESS_TIMEZONE).replace(tzinfo=None)
+
+
 def surplus_offers(
     restaurant_id: str, stock: list[StockInput], now: dt.datetime, close_hour: int = 22,
 ) -> list[dict]:
@@ -234,6 +263,9 @@ def surplus_offers(
     by perishability (from `freshnessWindow`). Offer copy comes from the same generator
     the marketing endpoint uses (LLM + template fallback).
     """
+    # Normalise before ANY wall-clock read: `.hour`, `.minute` and `.date()` below
+    # are all compared against Cairo-local quantities.
+    now = to_business_time(now)
     hours_left = max(0.0, close_hour - (now.hour + now.minute / 60))
     remaining_share = max(0.0, 1.0 - expected_sell_through(now.hour))
     results: list[dict] = []

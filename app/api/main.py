@@ -412,7 +412,10 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
 )
 def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusResponse:
     """Stores screen: products at risk near closing, with a discount and Arabic copy."""
-    now = req.timestamp or dt.datetime.now()
+    # Cairo, not the server's local zone: `closeHour` is a Cairo wall-clock hour,
+    # and this service is not guaranteed to be deployed in Egypt. An explicit
+    # `timestamp` from the caller is normalised inside surplus_offers.
+    now = req.timestamp or dt.datetime.now(restomind.BUSINESS_TIMEZONE)
     stock = [
         restomind.StockInput(
             product_id=s.productId, title=s.title, category=s.category,

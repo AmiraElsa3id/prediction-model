@@ -8,8 +8,9 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.api.main import app
-from app.integration.restomind import map_category
+from app.integration.restomind import map_category, to_business_time
 
+import datetime as dt
 import os
 
 os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
@@ -123,6 +124,69 @@ def test_surplus_offers_still_substitutes_the_default_for_a_null_estimate(client
     # 40/day * remaining share comfortably covers 15 units, so there is no
     # projected surplus and nothing to discount.
     assert r.json()["itemsAtRisk"] == []
+
+
+def test_to_business_time_converts_an_aware_instant_and_passes_naive_through():
+    """`close_hour` is a Cairo wall-clock hour, so the clock must be read in Cairo."""
+    # Summer: Cairo is UTC+3.
+    assert to_business_time(
+        dt.datetime(2026, 7, 29, 19, 30, tzinfo=dt.timezone.utc)
+    ) == dt.datetime(2026, 7, 29, 22, 30)
+    # Winter: UTC+2. A fixed offset would get one of these two wrong.
+    assert to_business_time(
+        dt.datetime(2026, 1, 15, 19, 30, tzinfo=dt.timezone.utc)
+    ) == dt.datetime(2026, 1, 15, 21, 30)
+    # Date rollover: 21:30Z in July is already the next Cairo day, and `.date()`
+    # is what keys the holiday/Ramadan calendar features.
+    assert to_business_time(
+        dt.datetime(2026, 7, 29, 21, 30, tzinfo=dt.timezone.utc)
+    ).date() == dt.date(2026, 7, 30)
+    # A naive timestamp is taken to already be Cairo wall-clock: untouched.
+    naive = dt.datetime(2026, 7, 29, 22, 30)
+    assert to_business_time(naive) == naive
+
+
+def test_surplus_offers_reads_the_clock_in_cairo_not_utc(client):
+    """An offset-aware UTC timestamp must be converted before `.hour` is read.
+
+    The RestoMind backend sends `new Date().toISOString()` -- Z-suffixed UTC --
+    which Pydantic parses as tz-aware UTC. Reading `.hour` off that compared a
+    UTC hour against `closeHour`, a *Cairo* wall-clock hour. In July (UTC+3),
+    at Cairo 22:30 -- half an hour past closing -- the scan thought it was 19:30
+    with 2.5 hours still to sell, and the sell-through curve still expected 9%
+    more to move. It under-flagged surplus at exactly the moment it runs.
+
+    The existing tests all passed *naive* timestamps, which is why this was
+    invisible; this one is deliberately offset-aware.
+    """
+    url = "/integration/restomind/surplus-offers"
+    # avgDailySales 0.0 -> always flagged, so hoursToClose is always observable
+    # and is the only thing varying between the three posts below.
+    dead_slow = {
+        "productId": "p_dead", "title": "بسبوسة قديمة", "category": "حلويات شرقية",
+        "price": 30, "freshnessWindow": 2, "avgDailySales": 0.0, "currentStock": 15,
+    }
+
+    def scan(timestamp):
+        r = client.post(url, json={"restaurantId": "R1", "stock": [dead_slow],
+                                   "timestamp": timestamp, "closeHour": 22})
+        assert r.status_code == 200
+        items = r.json()["itemsAtRisk"]
+        assert len(items) == 1
+        return items[0]
+
+    # 19:30Z is 22:30 in Cairo: closing time has already passed.
+    aware_utc = scan("2026-07-29T19:30:00Z")
+    # The same wall-clock moment, written the way this file's other tests write it.
+    naive_cairo = scan("2026-07-29T22:30:00")
+    # What the buggy reading effectively used: 19:30 treated as Cairo local.
+    naive_utc_hour = scan("2026-07-29T19:30:00")
+
+    assert aware_utc["hoursToClose"] == 0.0, "past closing -- nothing left to sell in"
+    assert aware_utc["hoursToClose"] == naive_cairo["hoursToClose"]
+    # The load-bearing half: it must NOT read as 19:30 local.
+    assert naive_utc_hour["hoursToClose"] == 2.5
+    assert aware_utc["hoursToClose"] != naive_utc_hour["hoursToClose"]
 
 
 def test_predict_matches_restomind_prediction_shape(client):

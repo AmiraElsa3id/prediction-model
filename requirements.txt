@@ -11,4 +11,8 @@ pydantic==2.13.4
 pytest==9.1.1
 scikit-learn==1.9.0
 streamlit==1.59.2
+# Required by `zoneinfo` on Windows, which has no system IANA database. Was only
+# ever present transitively; the surplus scan now depends on Africa/Cairo
+# resolving, so declare it.
+tzdata==2026.3
 uvicorn==0.51.0
