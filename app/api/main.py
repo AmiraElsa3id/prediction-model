@@ -308,7 +308,16 @@ def waste_prevention(req: schemas.WasteAlertRequest) -> schemas.WasteAlertRespon
 @app.post("/surplus/detect", response_model=schemas.SurplusResponse, tags=["surplus"])
 def surplus_detect(req: schemas.SurplusRequest) -> schemas.SurplusResponse:
     """Detect stagnant stock at risk of being wasted tonight."""
-    now = req.timestamp or dt.datetime.now()
+    # Cairo, like the sibling /integration/restomind/surplus-offers route below:
+    # `close_hour` is a Cairo wall-clock hour and so is the index of the
+    # sell-through curve `detect_surplus` reads, but that helper does no
+    # normalising of its own. A bare `dt.datetime.now()` is naive server-local
+    # (a UTC container yields a UTC wall clock read as Cairo), and an
+    # offset-aware `timestamp` from a caller had its UTC hour compared against a
+    # Cairo one. `now.date()` below keys the forecast off the same value.
+    now = restomind.to_business_time(
+        req.timestamp or dt.datetime.now(restomind.BUSINESS_TIMEZONE)
+    )
     service = _service()
 
     daily_forecast = {}

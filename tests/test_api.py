@@ -1,6 +1,7 @@
 """End-to-end API tests: every endpoint driven for real."""
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -122,6 +123,48 @@ def test_surplus_quiet_in_the_morning(client):
         "close_hour": 22,
     })
     assert r.json()["items_at_risk"] == []
+
+
+def test_surplus_detect_reads_an_offset_aware_timestamp_as_cairo(client):
+    """An aware instant must be read as the Cairo wall clock it represents.
+
+    `close_hour` is a Cairo wall-clock hour, and so is the index of the
+    sell-through curve `detect_surplus` reads. This endpoint passed the caller's
+    timestamp straight through, so an offset-aware UTC instant had its UTC hour
+    compared against a Cairo one. Its sibling
+    `/integration/restomind/surplus-offers` was fixed to normalise; this one
+    reads the same `close_hour` through the same curve and was not.
+
+    Every other surplus test here sends a NAIVE timestamp, which is exactly why
+    this stayed invisible.
+    """
+    stock = {"CAKE_GATEAU": 60, "PASTRY_CROISSANT": 40, "BREAD_BALADI": 300}
+
+    aware_utc = dt.datetime.fromisoformat(f"{NORMAL_DAY}T19:30:00+00:00")
+    cairo = aware_utc.astimezone(ZoneInfo("Africa/Cairo")).replace(tzinfo=None)
+    # NORMAL_DAY is in February, so Cairo is UTC+2: 19:30Z is 21:30 local.
+    assert cairo.hour == 21
+
+    from_aware = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": aware_utc.isoformat(), "close_hour": 22,
+    }).json()
+    from_cairo = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": cairo.isoformat(), "close_hour": 22,
+    }).json()
+
+    # The same instant, so necessarily the same answer.
+    assert from_aware["items_at_risk"] == from_cairo["items_at_risk"]
+
+    # And genuinely normalised rather than passed through: reading 19:30 as a
+    # Cairo wall clock leaves 2.5h to close instead of 0.5h, which the
+    # sell-through curve prices very differently.
+    naive_1930 = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": f"{NORMAL_DAY}T19:30:00", "close_hour": 22,
+    }).json()
+    assert (
+        from_aware["total_value_at_risk_egp"]
+        != naive_1930["total_value_at_risk_egp"]
+    )
 
 
 def test_generate_offer_returns_egyptian_arabic(client):
