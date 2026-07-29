@@ -49,9 +49,11 @@ async def lifespan(app: FastAPI):
     STATE["forecast"] = service
     STATE["offers"] = OfferService()
     STATE["publisher"] = MetaPublisher()
-    # Per-restaurant learned levels. Set REGISTRY_STORE to persist across restarts
-    # (default in-memory, so tests stay isolated).
-    STATE["registry"] = RestaurantRegistry(persist_path=os.getenv("REGISTRY_STORE"))
+    # Per-restaurant learned levels. Persist by default. In-memory only when
+    # REGISTRY_STORE is explicitly "" (which is what the test suite does to
+    # stay isolated).
+    store = os.getenv("REGISTRY_STORE", "data/registry.json")
+    STATE["registry"] = RestaurantRegistry(persist_path=store or None)
     yield
     STATE.clear()
 

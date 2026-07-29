@@ -10,6 +10,10 @@ import pytest
 from app.api.main import app
 from app.integration.restomind import map_category
 
+import os
+
+os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
+
 
 @pytest.fixture(scope="module")
 def client():

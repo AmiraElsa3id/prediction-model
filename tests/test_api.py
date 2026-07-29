@@ -7,6 +7,10 @@ from fastapi.testclient import TestClient
 
 from app.api.main import app
 
+import os
+
+os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
+
 
 @pytest.fixture(scope="module")
 def client():

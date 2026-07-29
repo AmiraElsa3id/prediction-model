@@ -80,3 +80,53 @@ def test_registry_status_reports_learned_products(client):
     st = client.get(f"/integration/restomind/status/{rid}").json()
     assert st["usingLearnedLevel"] == 1
     assert st["items"][0]["learnedLevel"] is not None
+
+
+def test_registry_survives_a_restart(tmp_path):
+    """Learned levels must outlive the process, or a redeploy resets every tenant."""
+    import pandas as pd
+    from app.integration.registry import RestaurantRegistry
+    from app.integration.restomind import ProductInput
+
+    store = tmp_path / "registry.json"
+    rows = pd.DataFrame([
+        {"date": d, "productId": "p1", "salesQty": 100}
+        # 30 consecutive days guarantees >= 14 quiet weekdays.
+        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+    ])
+
+    first = RestaurantRegistry(persist_path=store)
+    first.ingest("R1", rows, [ProductInput(product_id="p1", title="Bread", category="bread")])
+    assert first.status("R1")["usingLearnedLevel"] == 1
+    learned = first.status("R1")["items"][0]["learnedLevel"]
+
+    # Simulate a restart: a brand-new registry over the same file.
+    second = RestaurantRegistry(persist_path=store)
+    status = second.status("R1")
+    assert status["productsTracked"] == 1
+    assert status["usingLearnedLevel"] == 1
+    assert status["items"][0]["learnedLevel"] == learned
+    assert status["items"][0]["title"] == "Bread"
+
+
+def test_registry_store_is_not_pickle(tmp_path):
+    """The store is loaded at startup; it must not be an executable format."""
+    import json
+    from app.integration.registry import RestaurantRegistry
+    from app.integration.restomind import ProductInput
+    import pandas as pd
+
+    store = tmp_path / "registry.json"
+    reg = RestaurantRegistry(persist_path=store)
+    reg.ingest("R1", pd.DataFrame([{"date": "2025-01-06", "productId": "p1", "salesQty": 5}]),
+               [ProductInput(product_id="p1", title="Bread")])
+    json.loads(store.read_text(encoding="utf-8"))  # must parse as JSON
+
+
+def test_registry_tolerates_a_corrupt_store(tmp_path):
+    from app.integration.registry import RestaurantRegistry
+
+    store = tmp_path / "registry.json"
+    store.write_text("{ not json", encoding="utf-8")
+    reg = RestaurantRegistry(persist_path=store)  # must not raise
+    assert reg.status("R1")["productsTracked"] == 0
