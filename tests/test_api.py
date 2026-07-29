@@ -222,3 +222,28 @@ def test_integration_routes_require_the_shared_secret(monkeypatch, client):
 
     # Non-integration routes stay open.
     assert client.get("/health").status_code == 200
+
+
+def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
+    """CORSMiddleware must be the outermost layer, not wrapped by the secret guard.
+
+    Starlette builds the middleware stack so the LAST-registered middleware becomes
+    OUTERMOST. If the secret guard is registered after CORSMiddleware (as a naive
+    reading of "insert immediately after the CORSMiddleware block" would do), the
+    guard runs first and can short-circuit an OPTIONS preflight with a 401 before
+    CORSMiddleware ever gets a chance to attach Access-Control-Allow-* headers --
+    which makes every cross-origin browser call to a protected route fail at
+    preflight, correct secret or not, since the browser never gets to see the 401
+    body or retry with credentials for a request CORS itself rejected.
+    """
+    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+
+    preflight = client.options(
+        "/integration/restomind/predict",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert "access-control-allow-origin" in {k.lower() for k in preflight.headers.keys()}

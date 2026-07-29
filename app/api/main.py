@@ -71,16 +71,6 @@ app = FastAPI(
     ),
 )
 
-# Allow a browser frontend to call the model directly. Defaults to the local dev
-# frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @app.middleware("http")
 async def _require_shared_secret(request, call_next):
     """Gate the RestoMind integration routes behind a shared secret.
@@ -98,6 +88,24 @@ async def _require_shared_secret(request, call_next):
                          "detail": "Missing or invalid X-RestoMind-Key"},
             )
     return await call_next(request)
+
+
+# Allow a browser frontend to call the model directly. Defaults to the local dev
+# frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
+#
+# Registered AFTER the secret guard above -- Starlette builds its middleware stack so
+# the LAST-registered middleware becomes OUTERMOST. CORSMiddleware must be outermost
+# so it can answer OPTIONS preflights and attach Access-Control-Allow-* headers to
+# every response (including a 401 from the guard); registering it first would let the
+# guard's 401 short-circuit preflights before CORS ever ran, breaking every
+# cross-origin browser call to a protected route regardless of whether it holds the
+# correct secret.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _service() -> ForecastService:
