@@ -191,3 +191,34 @@ def test_weekly_batch_returns_seven_days_per_item(client):
     for item in b["items"]:
         assert len(item["days"]) == 7
         assert item["total_quantity"] == sum(d["recommended_quantity"] for d in item["days"])
+
+
+# -- integration auth -----------------------------------------------------------------
+
+
+def test_integration_routes_require_the_shared_secret(monkeypatch, client):
+    """Anyone who can reach the port must not be able to poison another tenant's
+    learned demand levels via /integration/restomind/* without the shared secret.
+
+    The guard reads AI_SHARED_SECRET per request, not at app construction, so this
+    reuses the module-level `app`/`client` fixture instead of reloading the module --
+    reloading would reconstruct the shared FastAPI app singleton, which this suite
+    already knows is ordering-sensitive (see Task 3's deferred-minor note about a test
+    that re-runs the app's lifespan and mutates global registry state). monkeypatch
+    also guarantees AI_SHARED_SECRET is unset again after this test regardless of
+    whether the assertions below pass or fail, so nothing leaks into later tests.
+    """
+    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+
+    payload = {"restaurantId": "R1", "productId": "p1", "title": "X",
+               "targetWeek": "2025-03-09", "avgDailySales": 10}
+
+    unauthenticated = client.post("/integration/restomind/predict", json=payload)
+    assert unauthenticated.status_code == 401
+
+    ok = client.post("/integration/restomind/predict", json=payload,
+                     headers={"X-RestoMind-Key": "s3cret"})
+    assert ok.status_code == 200
+
+    # Non-integration routes stay open.
+    assert client.get("/health").status_code == 200

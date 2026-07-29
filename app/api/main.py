@@ -11,6 +11,7 @@ registry -- noted in the plan, deliberately out of scope here.
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import os
 from contextlib import asynccontextmanager
 
@@ -70,14 +71,33 @@ app = FastAPI(
     ),
 )
 
-# Allow a browser frontend to call the model directly. Wide-open origins are fine for a
-# POC/demo; a real deployment should list the actual frontend domains here instead of "*".
+# Allow a browser frontend to call the model directly. Defaults to the local dev
+# frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _require_shared_secret(request, call_next):
+    """Gate the RestoMind integration routes behind a shared secret.
+
+    These routes read and mutate per-tenant learned demand levels, so anyone who
+    could reach the port could poison another restaurant's forecasts. Disabled
+    when AI_SHARED_SECRET is unset, which keeps local dev and tests unchanged.
+    """
+    secret = os.getenv("AI_SHARED_SECRET")
+    if secret and request.url.path.startswith("/integration/restomind"):
+        if not hmac.compare_digest(request.headers.get("X-RestoMind-Key", ""), secret):
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"error": "unauthorized",
+                         "detail": "Missing or invalid X-RestoMind-Key"},
+            )
+    return await call_next(request)
 
 
 def _service() -> ForecastService:
