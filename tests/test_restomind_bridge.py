@@ -80,6 +80,51 @@ def test_surplus_quiet_in_the_morning(client):
     assert r.json()["itemsAtRisk"] == []
 
 
+def test_surplus_offers_respects_a_zero_avg_daily_sales(client):
+    """avgDailySales=0 means "sells nothing" on the surplus path too.
+
+    `surplus_offers` used a truthy `s.avg_daily_sales or DEFAULT_DAILY_LEVEL`,
+    so a dead-slow SKU honestly reporting 0/day was credited with 40/day of
+    expected sell-through. Its projected surplus collapsed to ~0 and it was
+    skipped -- never flagged, never discounted -- which is precisely the stock
+    most at risk of being thrown away.
+    """
+    dead_slow = {
+        "productId": "p_dead", "title": "بسبوسة قديمة", "category": "حلويات شرقية",
+        "price": 30, "freshnessWindow": 2, "avgDailySales": 0.0, "currentStock": 15,
+    }
+    r = client.post("/integration/restomind/surplus-offers",
+                    json={"restaurantId": "R1", "stock": [dead_slow],
+                          "timestamp": "2025-02-11T14:00:00", "closeHour": 22})
+    assert r.status_code == 200
+    items = r.json()["itemsAtRisk"]
+    assert len(items) == 1, "a 0/day product with 15 units on hand must be flagged"
+    assert items[0]["productId"] == "p_dead"
+    # Nothing is expected to sell -> the whole 15 units are surplus -> raw_risk 1.0
+    # -> the top discount tier.
+    assert items[0]["projectedSurplus"] == 15
+    assert items[0]["suggestedDiscountPct"] == 40
+
+
+def test_surplus_offers_still_substitutes_the_default_for_a_null_estimate(client):
+    """None is "no estimate given" and must keep falling back to the default level.
+
+    Guards the fix above from over-correcting into "treat missing as zero",
+    which would flag every cold-start product as pure surplus.
+    """
+    unknown = {
+        "productId": "p_new", "title": "صنف جديد", "category": "حلويات شرقية",
+        "price": 30, "freshnessWindow": 2, "avgDailySales": None, "currentStock": 15,
+    }
+    r = client.post("/integration/restomind/surplus-offers",
+                    json={"restaurantId": "R1", "stock": [unknown],
+                          "timestamp": "2025-02-11T14:00:00", "closeHour": 22})
+    assert r.status_code == 200
+    # 40/day * remaining share comfortably covers 15 units, so there is no
+    # projected surplus and nothing to discount.
+    assert r.json()["itemsAtRisk"] == []
+
+
 def test_predict_matches_restomind_prediction_shape(client):
     """The /predict response must map onto their `predictions` document fields."""
     r = client.post("/integration/restomind/predict", json={

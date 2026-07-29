@@ -243,7 +243,15 @@ def surplus_offers(
             continue
         priors = category_priors(map_category(s.category))
         mult, _ = rule_multiplier(priors, CALENDAR.features(now.date()))
-        day_level = (s.avg_daily_sales or DEFAULT_DAILY_LEVEL) * mult
+        # `or` is a truthy test, so an honest 0.0 ("this product sells nothing")
+        # was silently replaced by DEFAULT_DAILY_LEVEL (40/day) -- exactly the
+        # dead-slow stock that most needs discounting was given a healthy
+        # expected sell-through, driving projected_surplus to 0 and skipping it
+        # below. `_forecast_one` already distinguishes the two; match it.
+        base_level = (
+            s.avg_daily_sales if s.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL
+        )
+        day_level = base_level * mult
         expected_remaining = day_level * remaining_share
 
         projected_surplus = max(0.0, s.current_stock - expected_remaining)
