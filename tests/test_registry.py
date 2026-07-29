@@ -83,7 +83,14 @@ def test_registry_status_reports_learned_products(client):
 
 
 def test_registry_survives_a_restart(tmp_path):
-    """Learned levels must outlive the process, or a redeploy resets every tenant."""
+    """Learned levels must outlive the process, or a redeploy resets every tenant.
+
+    Note: this pins round-trip / dtype fidelity (products, observed_days, learned_level,
+    titles all surviving a fresh RestaurantRegistry over the same file) -- it does NOT
+    discriminate pickle from JSON. It passes even against the old pickle-based store,
+    because pickle round-trips correctly too. That discrimination is
+    `test_registry_store_is_not_pickle`'s job; don't over-trust this one for that.
+    """
     import pandas as pd
     from app.integration.registry import RestaurantRegistry
     from app.integration.restomind import ProductInput
@@ -130,3 +137,27 @@ def test_registry_tolerates_a_corrupt_store(tmp_path):
     store.write_text("{ not json", encoding="utf-8")
     reg = RestaurantRegistry(persist_path=store)  # must not raise
     assert reg.status("R1")["productsTracked"] == 0
+
+
+def test_default_registry_store_path_is_used_when_unset(tmp_path, monkeypatch):
+    """Pins main.py's actual production default: with REGISTRY_STORE genuinely UNSET
+    (not just empty), the lifespan must persist under data/registry.json relative to
+    the process cwd. Every other test module in this suite forces REGISTRY_STORE=""
+    for isolation, so nothing else exercises this path -- this is the only test that
+    proves the fix in app/api/main.py actually takes effect in production.
+    """
+    monkeypatch.delenv("REGISTRY_STORE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    from app.api.main import app as real_app
+
+    with TestClient(real_app) as c:
+        rid, pid = "DEFAULT_R1", "DEFAULT_P1"
+        resp = c.post("/integration/restomind/ingest", json={
+            "restaurantId": rid,
+            "records": [{"date": "2025-01-06", "productId": pid, "salesQty": 5}],
+            "products": [{"productId": pid, "title": "Bread"}],
+        })
+        assert resp.status_code == 200
+
+    assert (tmp_path / "data" / "registry.json").exists()
