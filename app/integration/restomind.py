@@ -21,12 +21,17 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
 from app.core.market_priors import category_priors
 from app.core.surplus import SELL_THROUGH_CURVE, expected_sell_through
 from app.marketing.copy import OfferService
 from app.models.rule_based import rule_multiplier
+
+# Every wall-clock quantity this bridge reasons about -- `close_hour`, the
+# sell-through curve's hour index, the calendar's date -- is Cairo local time.
+BUSINESS_TIMEZONE = ZoneInfo("Africa/Cairo")
 
 # Fallback daily level when the owner gives no estimate for a product.
 DEFAULT_DAILY_LEVEL = 40.0
@@ -109,8 +114,11 @@ def _forecast_one(
     mult, factors = rule_multiplier(priors, feats)
     if level is not None:
         base = level
+    elif p.avg_daily_sales is not None:
+        # 0.0 is a real answer ("this product sells nothing"), not a missing value.
+        base = p.avg_daily_sales
     else:
-        base = p.avg_daily_sales if p.avg_daily_sales else DEFAULT_DAILY_LEVEL
+        base = DEFAULT_DAILY_LEVEL
     return base * mult, factors
 
 
@@ -158,13 +166,18 @@ def predict_week(
         d = week_start + dt.timedelta(days=i)
         feats = CALENDAR.features(d)
         qty, factors = _forecast_one(product, feats, level=level)
+        rounded = int(round(max(qty, 0)))
         daily.append({
             "date": d.isoformat(),
-            "qty": int(round(max(qty, 0))),
+            # `predictedQuantity` is the canonical name -- it matches RestoMind's
+            # DailyBreakdownItem schema, which is what consumes this array.
+            "predictedQuantity": rounded,
+            # DEPRECATED alias, kept one release so existing clients do not break.
+            "qty": rounded,
             "factors": factors,
         })
     # Sum the rounded daily values so the weekly total always reconciles with the breakdown.
-    total = sum(day["qty"] for day in daily)
+    total = sum(day["predictedQuantity"] for day in daily)
 
     # Feature snapshot -- what actually fed the prediction, for auditability.
     week_feats = CALENDAR.features(week_start)
@@ -172,7 +185,9 @@ def predict_week(
         "modelVersion": MODEL_VERSION,
         "mode": mode,
         "baseDailyLevel": round(
-            level if level is not None else (product.avg_daily_sales or DEFAULT_DAILY_LEVEL), 2
+            level if level is not None
+            else (product.avg_daily_sales if product.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL),
+            2,
         ),
         "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
         "categoryResolved": map_category(product.category) or "neutral",
@@ -215,6 +230,30 @@ class StockInput(ProductInput):
     current_stock: int = 0
 
 
+def to_business_time(now: dt.datetime) -> dt.datetime:
+    """Reduce any instant to Cairo wall-clock time, as a naive datetime.
+
+    `close_hour` is a *Cairo* wall-clock hour (22 = 10pm local), and so are the
+    hour index of the sell-through curve and the date the Egyptian calendar is
+    keyed on. The RestoMind backend sends an offset-aware UTC timestamp
+    (`new Date().toISOString()`), which Pydantic faithfully parses as UTC -- so
+    reading `.hour` off it compared a UTC hour against a Cairo one. In summer
+    (UTC+3) that is a three-hour error in the wrong direction: at Cairo 22:30,
+    actual closing time, `.hour` read 19, the curve still expected 9% more
+    sell-through, and `hours_left` claimed 2.5 hours remained. The scan
+    systematically under-flagged surplus at exactly the moment it exists to run.
+    `.date()` was wrong too, between Cairo 00:00 and 03:00, which mis-keys the
+    holiday/Ramadan calendar features.
+
+    A naive datetime is taken to already be Cairo wall-clock and passed through
+    unchanged -- there is no offset to reason about, and that is the shape the
+    bridge's own callers and tests use.
+    """
+    if now.tzinfo is None:
+        return now
+    return now.astimezone(BUSINESS_TIMEZONE).replace(tzinfo=None)
+
+
 def surplus_offers(
     restaurant_id: str, stock: list[StockInput], now: dt.datetime, close_hour: int = 22,
 ) -> list[dict]:
@@ -224,6 +263,9 @@ def surplus_offers(
     by perishability (from `freshnessWindow`). Offer copy comes from the same generator
     the marketing endpoint uses (LLM + template fallback).
     """
+    # Normalise before ANY wall-clock read: `.hour`, `.minute` and `.date()` below
+    # are all compared against Cairo-local quantities.
+    now = to_business_time(now)
     hours_left = max(0.0, close_hour - (now.hour + now.minute / 60))
     remaining_share = max(0.0, 1.0 - expected_sell_through(now.hour))
     results: list[dict] = []
@@ -233,7 +275,15 @@ def surplus_offers(
             continue
         priors = category_priors(map_category(s.category))
         mult, _ = rule_multiplier(priors, CALENDAR.features(now.date()))
-        day_level = (s.avg_daily_sales or DEFAULT_DAILY_LEVEL) * mult
+        # `or` is a truthy test, so an honest 0.0 ("this product sells nothing")
+        # was silently replaced by DEFAULT_DAILY_LEVEL (40/day) -- exactly the
+        # dead-slow stock that most needs discounting was given a healthy
+        # expected sell-through, driving projected_surplus to 0 and skipping it
+        # below. `_forecast_one` already distinguishes the two; match it.
+        base_level = (
+            s.avg_daily_sales if s.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL
+        )
+        day_level = base_level * mult
         expected_remaining = day_level * remaining_share
 
         projected_surplus = max(0.0, s.current_stock - expected_remaining)

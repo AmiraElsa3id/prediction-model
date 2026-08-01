@@ -18,7 +18,7 @@ tracked in HANDOFF.md §9.
 from __future__ import annotations
 
 import datetime as dt
-import pickle
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,6 +92,54 @@ class RestaurantState:
         confidence = "medium" if st.observed_days >= CONFIDENT_DAYS else "low"
         return st.learned_level, "rule_based_learned", confidence
 
+    def to_dict(self) -> dict:
+        return {
+            "restaurantId": self.restaurant_id,
+            "products": {
+                pid: {
+                    "product": {
+                        "product_id": st.product.product_id,
+                        "title": st.product.title,
+                        "category": st.product.category,
+                        "price": st.product.price,
+                        "freshness_window": st.product.freshness_window,
+                        "avg_daily_sales": st.product.avg_daily_sales,
+                    },
+                    "observed_days": st.observed_days,
+                    "learned_level": st.learned_level,
+                }
+                for pid, st in self.products.items()
+            },
+            "history": (
+                []
+                if self.history is None
+                else [
+                    {
+                        "date": str(r["date"])[:10],
+                        "productId": r["productId"],
+                        "salesQty": int(r["salesQty"]),
+                    }
+                    for r in self.history.to_dict("records")
+                ]
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "RestaurantState":
+        state = cls(restaurant_id=raw["restaurantId"])
+        for pid, p in raw.get("products", {}).items():
+            state.products[pid] = ProductState(
+                product=ProductInput(**p["product"]),
+                observed_days=p.get("observed_days", 0),
+                learned_level=p.get("learned_level"),
+            )
+        rows = raw.get("history") or []
+        if rows:
+            hist = pd.DataFrame(rows)
+            hist["date"] = pd.to_datetime(hist["date"])
+            state.history = hist
+        return state
+
 
 class RestaurantRegistry:
     """Holds `RestaurantState` per restaurantId. In-memory (POC); a real deployment
@@ -104,9 +152,13 @@ class RestaurantRegistry:
             self._load()
 
     def _load(self) -> None:
+        # JSON, not pickle: this file is read at startup, and unpickling is
+        # arbitrary code execution if anything can write to that path.
         try:
-            with self.persist_path.open("rb") as fh:
-                self._states = pickle.load(fh)
+            raw = json.loads(self.persist_path.read_text(encoding="utf-8"))
+            self._states = {
+                rid: RestaurantState.from_dict(s) for rid, s in raw.items()
+            }
         except Exception:
             self._states = {}   # corrupt/old file -> start fresh rather than crash
 
@@ -114,8 +166,11 @@ class RestaurantRegistry:
         if not self.persist_path:
             return
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.persist_path.open("wb") as fh:
-            pickle.dump(self._states, fh)
+        # Atomic: a crash mid-write must not leave a truncated store behind.
+        tmp = self.persist_path.with_suffix(self.persist_path.suffix + ".tmp")
+        payload = {rid: st.to_dict() for rid, st in self._states.items()}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.persist_path)
 
     def get(self, restaurant_id: str) -> RestaurantState:
         return self._states.setdefault(restaurant_id, RestaurantState(restaurant_id))

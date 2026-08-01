@@ -48,7 +48,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.api.main:app           # API + Swagger at /docs (trains on startup, ~20s)
 .venv/bin/streamlit run dashboard.py         # investor dashboard
 ```
-Env vars: `COLD_START=true` (start with no history, fully rule-based), `CORS_ORIGINS`,
+Env vars: `COLD_START=true` (start with no history, fully rule-based), `CORS_ORIGINS` (default `http://localhost:3000`),
 `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy + priors),
 `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing).
 
