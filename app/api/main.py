@@ -11,6 +11,7 @@ registry -- noted in the plan, deliberately out of scope here.
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import os
 from contextlib import asynccontextmanager
 
@@ -49,9 +50,11 @@ async def lifespan(app: FastAPI):
     STATE["forecast"] = service
     STATE["offers"] = OfferService()
     STATE["publisher"] = MetaPublisher()
-    # Per-restaurant learned levels. Set REGISTRY_STORE to persist across restarts
-    # (default in-memory, so tests stay isolated).
-    STATE["registry"] = RestaurantRegistry(persist_path=os.getenv("REGISTRY_STORE"))
+    # Per-restaurant learned levels. Persist by default. In-memory only when
+    # REGISTRY_STORE is explicitly "" (which is what the test suite does to
+    # stay isolated).
+    store = os.getenv("REGISTRY_STORE", "data/registry.json")
+    STATE["registry"] = RestaurantRegistry(persist_path=store or None)
     yield
     STATE.clear()
 
@@ -68,11 +71,38 @@ app = FastAPI(
     ),
 )
 
-# Allow a browser frontend to call the model directly. Wide-open origins are fine for a
-# POC/demo; a real deployment should list the actual frontend domains here instead of "*".
+@app.middleware("http")
+async def _require_shared_secret(request, call_next):
+    """Gate the RestoMind integration routes behind a shared secret.
+
+    These routes read and mutate per-tenant learned demand levels, so anyone who
+    could reach the port could poison another restaurant's forecasts. Disabled
+    when AI_SHARED_SECRET is unset, which keeps local dev and tests unchanged.
+    """
+    secret = os.getenv("AI_SHARED_SECRET")
+    if secret and request.url.path.startswith("/integration/restomind"):
+        if not hmac.compare_digest(request.headers.get("X-RestoMind-Key", ""), secret):
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"error": "unauthorized",
+                         "detail": "Missing or invalid X-RestoMind-Key"},
+            )
+    return await call_next(request)
+
+
+# Allow a browser frontend to call the model directly. Defaults to the local dev
+# frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
+#
+# Registered AFTER the secret guard above -- Starlette builds its middleware stack so
+# the LAST-registered middleware becomes OUTERMOST. CORSMiddleware must be outermost
+# so it can answer OPTIONS preflights and attach Access-Control-Allow-* headers to
+# every response (including a 401 from the guard); registering it first would let the
+# guard's 401 short-circuit preflights before CORS ever ran, breaking every
+# cross-origin browser call to a protected route regardless of whether it holds the
+# correct secret.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -278,7 +308,16 @@ def waste_prevention(req: schemas.WasteAlertRequest) -> schemas.WasteAlertRespon
 @app.post("/surplus/detect", response_model=schemas.SurplusResponse, tags=["surplus"])
 def surplus_detect(req: schemas.SurplusRequest) -> schemas.SurplusResponse:
     """Detect stagnant stock at risk of being wasted tonight."""
-    now = req.timestamp or dt.datetime.now()
+    # Cairo, like the sibling /integration/restomind/surplus-offers route below:
+    # `close_hour` is a Cairo wall-clock hour and so is the index of the
+    # sell-through curve `detect_surplus` reads, but that helper does no
+    # normalising of its own. A bare `dt.datetime.now()` is naive server-local
+    # (a UTC container yields a UTC wall clock read as Cairo), and an
+    # offset-aware `timestamp` from a caller had its UTC hour compared against a
+    # Cairo one. `now.date()` below keys the forecast off the same value.
+    now = restomind.to_business_time(
+        req.timestamp or dt.datetime.now(restomind.BUSINESS_TIMEZONE)
+    )
     service = _service()
 
     daily_forecast = {}
@@ -382,7 +421,10 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
 )
 def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusResponse:
     """Stores screen: products at risk near closing, with a discount and Arabic copy."""
-    now = req.timestamp or dt.datetime.now()
+    # Cairo, not the server's local zone: `closeHour` is a Cairo wall-clock hour,
+    # and this service is not guaranteed to be deployed in Egypt. An explicit
+    # `timestamp` from the caller is normalised inside surplus_offers.
+    now = req.timestamp or dt.datetime.now(restomind.BUSINESS_TIMEZONE)
     stock = [
         restomind.StockInput(
             product_id=s.productId, title=s.title, category=s.category,

@@ -119,7 +119,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | free-tier LLM for Arabic copy (Groq/Gemini/OpenRouter). Without it, templates are used. |
 | `META_PAGE_ID`, `META_ACCESS_TOKEN`, `META_PUBLISH_ENABLED` | live Meta publishing. All three required; otherwise `/marketing/publish` returns a preview. |
 | `COLD_START` | `true` starts with zero history (fully rule-based) for the cold-start demo. Default trains on the full simulated dataset. |
-| `CORS_ORIGINS` | comma-separated frontend origins allowed to call the API. Default `*` (fine for a POC; restrict for production). |
+| `CORS_ORIGINS` | comma-separated frontend origins allowed to call the API. Default `http://localhost:3000`; set explicitly for other deployments. |
 
 ## What's needed to move beyond the POC
 

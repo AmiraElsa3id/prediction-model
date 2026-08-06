@@ -1,11 +1,16 @@
 """End-to-end API tests: every endpoint driven for real."""
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api.main import app
+
+import os
+
+os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
 
 
 @pytest.fixture(scope="module")
@@ -120,6 +125,48 @@ def test_surplus_quiet_in_the_morning(client):
     assert r.json()["items_at_risk"] == []
 
 
+def test_surplus_detect_reads_an_offset_aware_timestamp_as_cairo(client):
+    """An aware instant must be read as the Cairo wall clock it represents.
+
+    `close_hour` is a Cairo wall-clock hour, and so is the index of the
+    sell-through curve `detect_surplus` reads. This endpoint passed the caller's
+    timestamp straight through, so an offset-aware UTC instant had its UTC hour
+    compared against a Cairo one. Its sibling
+    `/integration/restomind/surplus-offers` was fixed to normalise; this one
+    reads the same `close_hour` through the same curve and was not.
+
+    Every other surplus test here sends a NAIVE timestamp, which is exactly why
+    this stayed invisible.
+    """
+    stock = {"CAKE_GATEAU": 60, "PASTRY_CROISSANT": 40, "BREAD_BALADI": 300}
+
+    aware_utc = dt.datetime.fromisoformat(f"{NORMAL_DAY}T19:30:00+00:00")
+    cairo = aware_utc.astimezone(ZoneInfo("Africa/Cairo")).replace(tzinfo=None)
+    # NORMAL_DAY is in February, so Cairo is UTC+2: 19:30Z is 21:30 local.
+    assert cairo.hour == 21
+
+    from_aware = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": aware_utc.isoformat(), "close_hour": 22,
+    }).json()
+    from_cairo = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": cairo.isoformat(), "close_hour": 22,
+    }).json()
+
+    # The same instant, so necessarily the same answer.
+    assert from_aware["items_at_risk"] == from_cairo["items_at_risk"]
+
+    # And genuinely normalised rather than passed through: reading 19:30 as a
+    # Cairo wall clock leaves 2.5h to close instead of 0.5h, which the
+    # sell-through curve prices very differently.
+    naive_1930 = client.post("/surplus/detect", json={
+        "stock": stock, "timestamp": f"{NORMAL_DAY}T19:30:00", "close_hour": 22,
+    }).json()
+    assert (
+        from_aware["total_value_at_risk_egp"]
+        != naive_1930["total_value_at_risk_egp"]
+    )
+
+
 def test_generate_offer_returns_egyptian_arabic(client):
     r = client.post("/marketing/generate-offer",
                     json={"sku": "CAKE_GATEAU", "discount_pct": 30})
@@ -187,3 +234,59 @@ def test_weekly_batch_returns_seven_days_per_item(client):
     for item in b["items"]:
         assert len(item["days"]) == 7
         assert item["total_quantity"] == sum(d["recommended_quantity"] for d in item["days"])
+
+
+# -- integration auth -----------------------------------------------------------------
+
+
+def test_integration_routes_require_the_shared_secret(monkeypatch, client):
+    """Anyone who can reach the port must not be able to poison another tenant's
+    learned demand levels via /integration/restomind/* without the shared secret.
+
+    The guard reads AI_SHARED_SECRET per request, not at app construction, so this
+    reuses the module-level `app`/`client` fixture instead of reloading the module --
+    reloading would reconstruct the shared FastAPI app singleton, which this suite
+    already knows is ordering-sensitive (see Task 3's deferred-minor note about a test
+    that re-runs the app's lifespan and mutates global registry state). monkeypatch
+    also guarantees AI_SHARED_SECRET is unset again after this test regardless of
+    whether the assertions below pass or fail, so nothing leaks into later tests.
+    """
+    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+
+    payload = {"restaurantId": "R1", "productId": "p1", "title": "X",
+               "targetWeek": "2025-03-09", "avgDailySales": 10}
+
+    unauthenticated = client.post("/integration/restomind/predict", json=payload)
+    assert unauthenticated.status_code == 401
+
+    ok = client.post("/integration/restomind/predict", json=payload,
+                     headers={"X-RestoMind-Key": "s3cret"})
+    assert ok.status_code == 200
+
+    # Non-integration routes stay open.
+    assert client.get("/health").status_code == 200
+
+
+def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
+    """CORSMiddleware must be the outermost layer, not wrapped by the secret guard.
+
+    Starlette builds the middleware stack so the LAST-registered middleware becomes
+    OUTERMOST. If the secret guard is registered after CORSMiddleware (as a naive
+    reading of "insert immediately after the CORSMiddleware block" would do), the
+    guard runs first and can short-circuit an OPTIONS preflight with a 401 before
+    CORSMiddleware ever gets a chance to attach Access-Control-Allow-* headers --
+    which makes every cross-origin browser call to a protected route fail at
+    preflight, correct secret or not, since the browser never gets to see the 401
+    body or retry with credentials for a request CORS itself rejected.
+    """
+    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+
+    preflight = client.options(
+        "/integration/restomind/predict",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert "access-control-allow-origin" in {k.lower() for k in preflight.headers.keys()}

@@ -27,12 +27,12 @@ from app.core.items import BY_SKU, Item
 # Dialect note: these are Egyptian colloquial (masri), not Modern Standard Arabic.
 # MSA reads as stiff and corporate in a neighbourhood bakery's social feed.
 TEMPLATES = [
-    "🔥 آخر فرصة! {item} بخصم {discount}% لحد الساعة {close}. الكمية محدودة يا جماعة!",
-    "طازة من الفرن 🥐 {item} النهاردة بخصم {discount}%! تعالى بسرعة قبل ما يخلص.",
-    "عرض النهاردة بس! 🎉 {item} بـ {new_price} جنيه بدل {old_price}. لحق نفسك!",
-    "خصم {discount}% على {item} 😍 لحد ما نقفل الساعة {close}. متفوتش الفرصة!",
-    "يا حلاوة! 🍰 {item} بخصم {discount}% النهاردة. أول ما تيجي أول ما تاخد!",
-    "الكمية بتقل! ⏰ {item} بخصم {discount}% لحد {close}. اطلب دلوقتي.",
+    "🔥 فرصة مميزة اليوم! احصل على {item} بخصم {discount}% حتى الساعة {close}. الكمية محدودة!",
+    "طازج وبأعلى جودة 🥐 استمتع بـ {item} اليوم بخصم خاص {discount}%! اطلبه الآن قبل نفاد الكمية.",
+    "عرض اليوم الخاص! 🎉 {item} بسعر {new_price} جنيه بدلاً من {old_price} جنيه. لا تفوت العرض!",
+    "استمتع بخصم {discount}% على {item} 😍 العرض ساري حتى الساعة {close}. نتشرف بخدمتكم!",
+    "تذوق الأفضل 🍰 احصل على {item} بخصم {discount}% اليوم. الأسبقية للأسبقية!",
+    "عرض حصري لفترة محدودة ⏰ {item} بخصم {discount}% حتى الساعة {close}. اطلب الآن!",
 ]
 
 # Refuse anything that over-promises or invents claims we cannot stand behind.
