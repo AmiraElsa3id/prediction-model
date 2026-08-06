@@ -12,6 +12,7 @@ pymongo==4.17.0
 pytest==9.1.1
 scikit-learn==1.9.0
 streamlit==1.59.2
+tavily-python==0.7.27
 # Required by `zoneinfo` on Windows, which has no system IANA database. Was only
 # ever present transitively; the surplus scan now depends on Africa/Cairo
 # resolving, so declare it.

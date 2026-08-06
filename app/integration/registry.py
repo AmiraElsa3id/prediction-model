@@ -157,18 +157,23 @@ class RestaurantRegistry:
         self._states: dict[str, RestaurantState] = {}
         self.persist_path = Path(persist_path) if persist_path else None
         self._mongo = None
+        self._priors_store = None  # approved market-research overrides; Mongo-only,
+                                    # no JSON-file equivalent (see plan.md Part C)
 
         if mongo_url:
             from app.integration.mongo_store import MongoRegistryStore
+            from app.integration.priors_store import PriorsStore
 
             try:
                 self._mongo = MongoRegistryStore(mongo_url)
+                self._priors_store = PriorsStore(mongo_url)
             except Exception:
                 # Unreachable/misconfigured MONGO_URL at startup must degrade to an
                 # empty, in-memory-only registry, not take the whole service down --
                 # same "start empty rather than crash" discipline as a corrupt JSON
                 # store already has below.
                 self._mongo = None
+                self._priors_store = None
             else:
                 self._load()
         elif self.persist_path and self.persist_path.exists():
@@ -246,13 +251,24 @@ class RestaurantRegistry:
         self, restaurant_id: str, product: ProductInput, week_start: dt.date,
         promotion_active: bool = False,
     ) -> dict:
-        """Weekly prediction that uses the restaurant's learned level when available."""
+        """Weekly prediction that uses the restaurant's learned level when available,
+        plus any explicitly-approved market-research multipliers for this tenant."""
         state = self.get(restaurant_id)
         state.upsert_products([product])
         level, mode, confidence = state._level_and_mode(product.product_id)
+
+        overrides = None
+        if self._priors_store is not None:
+            category = map_category(product.category)
+            try:
+                overrides = self._priors_store.approved_multipliers(restaurant_id, category) or None
+            except Exception:
+                overrides = None  # Mongo hiccup mid-request -> fall back to defaults, don't 500
+
         return predict_week(
             restaurant_id, product, week_start,
             promotion_active=promotion_active, level=level, mode=mode, confidence=confidence,
+            researched_overrides=overrides,
         )
 
     def status(self, restaurant_id: str) -> dict:

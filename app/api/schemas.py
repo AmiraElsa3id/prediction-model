@@ -463,6 +463,44 @@ class RMRegistryStatusResponse(BaseModel):
     items: list[dict]
 
 
+# -- market research agent (plan.md Part C) -------------------------------------------
+
+
+class ResearchPriorsRequest(BaseModel):
+    restaurantId: str
+    # Bounded: each category x event pair is a Tavily search + an LLM call --
+    # see app/agents/market_research.py's MAX_SEARCHES_PER_RUN (OWASP LLM04).
+    categories: list[str] = Field(..., min_length=1, max_length=10)
+    events: list[str] | None = Field(
+        None, description="Defaults to every known event key (weekend, ramadan, ...)"
+    )
+    location: str = Field("Egypt", max_length=60)
+
+
+class ResearchPriorsResponse(BaseModel):
+    restaurantId: str
+    # One dict per (category, event) pair -- status is "researched" | "rejected" |
+    # "no_sources" | "search_failed" | "synthesis_failed" | "unavailable". Every
+    # "researched" result is stored as pending_review, NOT applied to live forecasts.
+    results: list[dict]
+
+
+class ApprovePriorsRequest(BaseModel):
+    restaurantId: str
+    category: str
+    event: str
+
+
+class ApprovePriorsResponse(BaseModel):
+    approved: bool
+    message: str
+
+
+class PendingPriorsResponse(BaseModel):
+    restaurantId: str
+    pending: list[dict]
+
+
 # -- errors --------------------------------------------------------------------------
 
 

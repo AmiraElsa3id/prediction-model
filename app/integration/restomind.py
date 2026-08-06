@@ -103,14 +103,24 @@ class ProductInput:
 
 def _forecast_one(
     p: "ProductInput", feats: dict, level: float | None = None,
+    researched_overrides: dict[str, float] | None = None,
 ) -> tuple[float, list[dict]]:
     """Core rule-based point estimate for one product on one day.
 
     Shared by the daily production plan and the weekly prediction so both always agree.
     `level` overrides the daily baseline when a value learned from real sales exists
     (see the multi-tenant registry); otherwise the owner's estimate / default is used.
+
+    `researched_overrides` -- explicitly-APPROVED multipliers from the Tavily-grounded
+    market research agent (app/agents/market_research.py), keyed by event
+    (PriorsStore.approved_multipliers). Deliberately a plain dict, not a DB lookup done
+    in here: this function stays a pure calculation, and only ever sees a multiplier
+    that already passed the pending_review -> approved gate -- an unreviewed research
+    result must never reach a live forecast (see priors_store.py's module docstring).
     """
-    priors = category_priors(map_category(p.category))
+    priors = dict(category_priors(map_category(p.category)))
+    if researched_overrides:
+        priors.update(researched_overrides)
     mult, factors = rule_multiplier(priors, feats)
     if level is not None:
         base = level
@@ -124,13 +134,20 @@ def _forecast_one(
 
 def production_plan(
     restaurant_id: str, products: list[ProductInput], target_date: dt.date,
+    researched_overrides_by_category: dict[str, dict[str, float]] | None = None,
 ) -> list[dict]:
-    """Per-product production recommendation for a restaurant on a date (rule-based)."""
+    """Per-product production recommendation for a restaurant on a date (rule-based).
+
+    `researched_overrides_by_category` -- approved market-research multipliers, keyed
+    by the product's RESOLVED category (map_category(p.category)), each value itself
+    an {event: multiplier} dict. See _forecast_one's docstring.
+    """
     feats = CALENDAR.features(target_date)
     out: list[dict] = []
 
     for p in products:
-        qty, factors = _forecast_one(p, feats)
+        overrides = (researched_overrides_by_category or {}).get(map_category(p.category))
+        qty, factors = _forecast_one(p, feats, researched_overrides=overrides)
         out.append({
             "productId": p.product_id,
             "title": p.title,
@@ -149,6 +166,7 @@ def predict_week(
     restaurant_id: str, product: ProductInput, week_start: dt.date,
     promotion_active: bool = False, level: float | None = None,
     mode: str = "rule_based", confidence: str = "low",
+    researched_overrides: dict[str, float] | None = None,
 ) -> dict:
     """Weekly prediction shaped for RestoMind's `predictions` collection.
 
@@ -165,7 +183,7 @@ def predict_week(
     for i in range(7):
         d = week_start + dt.timedelta(days=i)
         feats = CALENDAR.features(d)
-        qty, factors = _forecast_one(product, feats, level=level)
+        qty, factors = _forecast_one(product, feats, level=level, researched_overrides=researched_overrides)
         rounded = int(round(max(qty, 0)))
         daily.append({
             "date": d.isoformat(),
