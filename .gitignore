@@ -20,6 +20,11 @@ data/registry_state.pkl
 data/models/
 # ملاحظة: data/market_priors.json ملف مصدري — بيترفع عادي
 
+# ── raw downloaded Kaggle datasets (M5, Favorita) — used by the real-data backtests
+# on test/new-case, never committed: train.csv alone is ~5GB (Favorita) ──
+data/m5/
+data/favorita/
+
 # ── أسرار وإعدادات محلية ──
 .env
 .env.*
