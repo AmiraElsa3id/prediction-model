@@ -1,5 +1,31 @@
 # Plan: security fixes + persistent, market-researched, LLM-backed rule engine
 
+## Implementation status: all four parts done, on `feature/security-persistence-agent`
+
+Implemented on top of 9 upstream commits that landed after this plan was written and
+covered real ground already -- `feat: require a shared secret on the RestoMind
+integration routes`, `fix: persist the restaurant registry durably as JSON`, and
+correct CORS/guard middleware ordering among them. What follows is what was still
+needed on top of that, not a restatement of work already done upstream.
+
+| Part | What actually shipped | vs. the original plan below |
+|---|---|---|
+| A | `title` bounded to 120 chars (2 request schemas), `stock` bounded to 50 items, `/marketing/publish` restructured to take an opaque `offerId` instead of raw `copy_ar`, the existing shared-secret guard extended from `/integration/restomind/*` to also cover `/marketing/*` | A2 (auth) and A5 (CORS) turned out to already be fixed upstream -- narrower scope than planned, see A2/A5 below |
+| B | `app/integration/mongo_store.py`, wired into `RestaurantRegistry` via a new `mongo_url` param (`MONGO_URL` wins over the JSON file). Verified against a real local Mongo: killed the process, started a fresh one, confirmed the learned level survived | Matches the plan -- reused `to_dict()`/`from_dict()`, which upstream's JSON fix had already written and tested |
+| C | `app/agents/market_research.py` + `app/integration/priors_store.py`, three new endpoints, and **wired into the actual forecast path** (`_forecast_one`/`predict_week`/`production_plan` in `restomind.py`, looked up per-request in `registry.py`) | Went further than the plan's storage-only description -- verified live that an approved researched multiplier changes a running server's next prediction, not just that it can be stored |
+| D | The agent reuses `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` unchanged -- no new LLM integration convention | As planned -- this was mostly "keep what's there" |
+
+**Tests:** 119/119 pass (100 pre-existing + 3 A1/A4/auth + 3 Mongo registry + 13
+market-research/priors-store). Mongo-touching tests skip gracefully with no local
+MongoDB reachable, so the suite stays green in environments without one.
+
+**Not done, deliberately out of scope for this pass:** `slowapi` rate limiting (A4
+mentioned it; the `max_length` bounds close the same DoS surface without adding a new
+dependency for it) and a UI for the approve/reject step (`POST approve-priors` exists;
+nothing calls it automatically, by design -- see priors_store.py's module docstring).
+
+---
+
 ## Context
 
 This plan covers four things, in order of dependency:
