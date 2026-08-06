@@ -271,6 +271,9 @@ class OfferRequest(SKUMixin):
 
 
 class OfferResponse(BaseModel):
+    offerId: str = Field(
+        ..., description="Opaque id -- pass this to /marketing/publish, not copy_ar directly"
+    )
     sku: str
     item_name_ar: str
     discount_pct: int
@@ -283,8 +286,11 @@ class OfferResponse(BaseModel):
 
 
 class PublishRequest(BaseModel):
-    sku: str
-    copy_ar: str = Field(..., description="Copy to publish")
+    # References a previously-generated offer (see OfferResponse.offerId) rather than
+    # accepting raw text -- free-text copy here would bypass /marketing/generate-offer's
+    # _validate() entirely and let anyone post arbitrary, unreviewed text to a real
+    # public page (OWASP LLM02, Insecure Output Handling).
+    offerId: str = Field(..., description="From a prior /marketing/generate-offer response")
     platforms: list[str] = Field(
         default_factory=lambda: ["facebook"],
         description="Target platforms: 'facebook' and/or 'instagram'",
@@ -323,7 +329,11 @@ class RMProduct(BaseModel):
     """A RestoMind product, as the bridge needs it (mirrors their Product model)."""
 
     productId: str = Field(..., description="RestoMind Product _id")
-    title: str
+    # Bounded: this string is interpolated directly into an LLM prompt (see
+    # app/marketing/copy.py). Unbounded length both widens the prompt-injection
+    # surface and lets one request balloon the token cost of every LLM call it
+    # triggers -- OWASP LLM01 (Prompt Injection) / LLM04 (Model DoS).
+    title: str = Field(..., max_length=120)
     category: str | None = Field(None, description="Category name (Arabic/English free text)")
     price: float = Field(0.0, ge=0)
     freshnessWindow: float | None = Field(
@@ -365,7 +375,10 @@ class RMStockProduct(RMProduct):
 
 class RMSurplusRequest(BaseModel):
     restaurantId: str
-    stock: list[RMStockProduct] = Field(..., min_length=1)
+    # max_length=50: each "at risk" item can trigger its own LLM call in
+    # surplus_offers -- an unbounded array lets one request trigger an unbounded
+    # number of costly LLM calls (OWASP LLM04, Model Denial of Service).
+    stock: list[RMStockProduct] = Field(..., min_length=1, max_length=50)
     timestamp: dt.datetime | None = Field(None, description="Defaults to now; meant near closing")
     closeHour: int = Field(22, ge=0, le=23)
 
@@ -394,7 +407,7 @@ class RMPredictRequest(BaseModel):
 
     restaurantId: str
     productId: str
-    title: str
+    title: str = Field(..., max_length=120)  # see RMProduct.title -- same reasoning
     targetWeek: dt.date = Field(..., description="First day of the target week (YYYY-MM-DD)")
     category: str | None = Field(None, description="Category name (Arabic/English free text)")
     avgDailySales: float | None = Field(

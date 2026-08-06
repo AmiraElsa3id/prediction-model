@@ -179,10 +179,19 @@ def test_generate_offer_returns_egyptian_arabic(client):
     assert b["generator"] in {"llm", "template"}
 
 
-def test_publish_defaults_to_dry_run(client):
+def test_publish_requires_a_real_offer_id(client):
+    """copy_ar is no longer accepted directly -- publishing has to reference an
+    offer that already passed generate-offer's _validate() (OWASP LLM02)."""
     r = client.post("/marketing/publish",
-                    json={"sku": "CAKE_GATEAU", "copy_ar": "عرض تجريبي",
-                          "platforms": ["facebook"]})
+                    json={"offerId": "not-a-real-id", "platforms": ["facebook"]})
+    assert r.status_code == 404
+
+
+def test_publish_defaults_to_dry_run(client):
+    offer = client.post("/marketing/generate-offer",
+                        json={"sku": "CAKE_GATEAU", "discount_pct": 30}).json()
+    r = client.post("/marketing/publish",
+                    json={"offerId": offer["offerId"], "platforms": ["facebook"]})
     b = r.json()
     assert b["status"] == "preview"
     assert b["dry_run"] is True
@@ -191,8 +200,10 @@ def test_publish_defaults_to_dry_run(client):
 
 def test_publish_live_refuses_without_credentials(client):
     """Live publishing must fail closed, never silently no-op as if it worked."""
+    offer = client.post("/marketing/generate-offer",
+                        json={"sku": "CAKE_GATEAU", "discount_pct": 30}).json()
     r = client.post("/marketing/publish",
-                    json={"sku": "CAKE_GATEAU", "copy_ar": "عرض تجريبي",
+                    json={"offerId": offer["offerId"],
                           "platforms": ["facebook"], "dry_run": False})
     b = r.json()
     assert b["status"] == "failed"
@@ -265,6 +276,51 @@ def test_integration_routes_require_the_shared_secret(monkeypatch, client):
 
     # Non-integration routes stay open.
     assert client.get("/health").status_code == 200
+
+
+def test_marketing_routes_also_require_the_shared_secret(monkeypatch, client):
+    """/marketing joined the guard alongside /integration/restomind -- both
+    /generate-offer and /publish drive real LLM/Meta calls an unauthenticated caller
+    could otherwise trigger for free (OWASP LLM04) or use to bypass copy validation
+    entirely by reaching /publish directly (OWASP LLM02)."""
+    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+
+    unauthenticated = client.post(
+        "/marketing/generate-offer", json={"sku": "CAKE_GATEAU", "discount_pct": 30}
+    )
+    assert unauthenticated.status_code == 401
+
+    ok = client.post(
+        "/marketing/generate-offer", json={"sku": "CAKE_GATEAU", "discount_pct": 30},
+        headers={"X-RestoMind-Key": "s3cret"},
+    )
+    assert ok.status_code == 200
+
+    assert client.post(
+        "/marketing/publish", json={"offerId": "whatever", "platforms": ["facebook"]}
+    ).status_code == 401
+
+
+def test_title_over_max_length_is_rejected(client):
+    """OWASP LLM01 -- title is interpolated directly into an LLM prompt; unbounded
+    length widens the injection surface with no legitimate use case for it."""
+    r = client.post(
+        "/integration/restomind/predict",
+        json={"restaurantId": "R1", "productId": "p1", "title": "x" * 121,
+              "targetWeek": "2025-03-09", "avgDailySales": 10},
+    )
+    assert r.status_code == 422
+
+
+def test_surplus_stock_over_max_length_is_rejected(client):
+    """OWASP LLM04 -- each stock item can trigger its own LLM call; an unbounded
+    array lets one request trigger an unbounded number of them."""
+    stock = [{"productId": f"p{i}", "title": "X", "currentStock": 5} for i in range(51)]
+    r = client.post(
+        "/integration/restomind/surplus-offers",
+        json={"restaurantId": "R1", "stock": stock},
+    )
+    assert r.status_code == 422
 
 
 def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
