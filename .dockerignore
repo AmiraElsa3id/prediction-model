@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data (mounted as a volume at runtime; baking into the image wastes layer space)
+data/synthetic_pos.parquet
+data/models/
+data/registry*.json
+
+# Docs / notebooks
+*.md
+*.html
+*.pdf
+*.ipynb
+postman_collection.json
+
+# Dev tooling
+.git/
+.gitignore
+.code-review-graph/
+docker-compose*.yml
+Dockerfile
