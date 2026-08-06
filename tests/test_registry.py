@@ -161,3 +161,95 @@ def test_default_registry_store_path_is_used_when_unset(tmp_path, monkeypatch):
         assert resp.status_code == 200
 
     assert (tmp_path / "data" / "registry.json").exists()
+
+
+# -- MongoDB-backed persistence -------------------------------------------------------
+# Skipped, not failed, when no local Mongo is reachable -- these exercise a real
+# connection rather than mocking pymongo, so CI/dev environments without one still
+# pass the rest of the suite. A separate DB name from RestoMindAPI's own, so this
+# never touches real seeded data.
+
+MONGO_TEST_URL = "mongodb://127.0.0.1:27017/prediction_model_test"
+
+
+def _mongo_reachable() -> bool:
+    try:
+        from pymongo import MongoClient
+
+        MongoClient(MONGO_TEST_URL, serverSelectionTimeoutMS=1000).admin.command("ping")
+        return True
+    except Exception:
+        return False
+
+
+requires_mongo = pytest.mark.skipif(
+    not _mongo_reachable(), reason="no local MongoDB reachable at 127.0.0.1:27017"
+)
+
+
+@pytest.fixture
+def mongo_registry():
+    """A RestaurantRegistry over a clean Mongo collection, cleaned up after too --
+    tests must not leave state that affects a later run."""
+    from pymongo import MongoClient
+
+    from app.integration.registry import RestaurantRegistry
+
+    MongoClient(MONGO_TEST_URL).get_default_database()["ai_registry_state"].delete_many({})
+    reg = RestaurantRegistry(mongo_url=MONGO_TEST_URL)
+    yield reg
+    MongoClient(MONGO_TEST_URL).get_default_database()["ai_registry_state"].delete_many({})
+
+
+@requires_mongo
+def test_registry_survives_a_restart_via_mongo(mongo_registry):
+    """The actual point of Part B: kill the process, a fresh RestaurantRegistry
+    over the same MONGO_URL must see the same learned levels -- not the JSON-file
+    path, a real second connection to a real database."""
+    import pandas as pd
+
+    from app.integration.registry import RestaurantRegistry
+    from app.integration.restomind import ProductInput
+
+    rows = pd.DataFrame([
+        {"date": d, "productId": "p1", "salesQty": 100}
+        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+    ])
+    mongo_registry.ingest("R1", rows, [ProductInput(product_id="p1", title="Bread", category="bread")])
+    assert mongo_registry.status("R1")["usingLearnedLevel"] == 1
+    learned = mongo_registry.status("R1")["items"][0]["learnedLevel"]
+
+    second = RestaurantRegistry(mongo_url=MONGO_TEST_URL)  # simulates a restart
+    status = second.status("R1")
+    assert status["usingLearnedLevel"] == 1
+    assert status["items"][0]["learnedLevel"] == learned
+    assert status["items"][0]["title"] == "Bread"
+
+
+@requires_mongo
+def test_mongo_registry_is_per_tenant(mongo_registry):
+    """Same isolation guarantee the JSON-file/in-memory path already has -- must
+    hold across a real database too, since it's now a shared resource multiple
+    service instances could write to."""
+    import pandas as pd
+
+    from app.integration.restomind import ProductInput
+
+    rows = pd.DataFrame([
+        {"date": d, "productId": "shared", "salesQty": 200}
+        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+    ])
+    mongo_registry.ingest("TENANT_A", rows, [ProductInput(product_id="shared", title="X")])
+
+    assert mongo_registry.status("TENANT_A")["usingLearnedLevel"] == 1
+    assert mongo_registry.status("TENANT_B")["productsTracked"] == 0
+
+
+@requires_mongo
+def test_mongo_unreachable_at_startup_starts_empty_not_crashing():
+    """A bad/unreachable MONGO_URL must degrade to an empty registry, not take the
+    whole service down at startup."""
+    from app.integration.registry import RestaurantRegistry
+
+    reg = RestaurantRegistry(mongo_url="mongodb://127.0.0.1:1/nonexistent")
+    assert reg.status("R1")["productsTracked"] == 0

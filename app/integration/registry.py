@@ -142,16 +142,48 @@ class RestaurantState:
 
 
 class RestaurantRegistry:
-    """Holds `RestaurantState` per restaurantId. In-memory (POC); a real deployment
-    persists this per tenant."""
+    """Holds `RestaurantState` per restaurantId, backed by one of two persistence
+    modes -- MongoDB (preferred; see mongo_store.py) or a local JSON file (kept for
+    environments without a database configured). The in-memory `_states` dict is
+    always a read-through cache regardless of mode: predictions never pay a DB
+    round-trip, only `ingest()` (already an I/O-bound call) does.
+    """
 
-    def __init__(self, persist_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        persist_path: str | Path | None = None,
+        mongo_url: str | None = None,
+    ) -> None:
         self._states: dict[str, RestaurantState] = {}
         self.persist_path = Path(persist_path) if persist_path else None
-        if self.persist_path and self.persist_path.exists():
+        self._mongo = None
+
+        if mongo_url:
+            from app.integration.mongo_store import MongoRegistryStore
+
+            try:
+                self._mongo = MongoRegistryStore(mongo_url)
+            except Exception:
+                # Unreachable/misconfigured MONGO_URL at startup must degrade to an
+                # empty, in-memory-only registry, not take the whole service down --
+                # same "start empty rather than crash" discipline as a corrupt JSON
+                # store already has below.
+                self._mongo = None
+            else:
+                self._load()
+        elif self.persist_path and self.persist_path.exists():
             self._load()
 
     def _load(self) -> None:
+        if self._mongo is not None:
+            try:
+                raw = self._mongo.load_all()
+            except Exception:
+                self._states = {}  # Mongo unreachable at startup -> start empty, not crash
+                return
+            self._states = {rid: RestaurantState.from_dict(s) for rid, s in raw.items()}
+            return
+
         # JSON, not pickle: this file is read at startup, and unpickling is
         # arbitrary code execution if anything can write to that path.
         try:
@@ -162,7 +194,18 @@ class RestaurantRegistry:
         except Exception:
             self._states = {}   # corrupt/old file -> start fresh rather than crash
 
-    def _save(self) -> None:
+    def _save(self, restaurant_id: str | None = None) -> None:
+        """Persist. `restaurant_id`, when given, lets the Mongo path write through
+        just the one tenant that changed instead of re-serialising every tenant on
+        every ingest -- the exact per-write cost problem a single JSON file has."""
+        if self._mongo is not None:
+            if restaurant_id is not None:
+                self._mongo.save(restaurant_id, self._states[restaurant_id].to_dict())
+            else:
+                for rid, st in self._states.items():
+                    self._mongo.save(rid, st.to_dict())
+            return
+
         if not self.persist_path:
             return
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,7 +230,7 @@ class RestaurantRegistry:
             if pid not in state.products:
                 state.upsert_products([ProductInput(product_id=pid, title=pid)])
         state.ingest(records)
-        self._save()
+        self._save(restaurant_id)
         return {
             "restaurantId": restaurant_id,
             "rowsIngested": int(len(records)),
