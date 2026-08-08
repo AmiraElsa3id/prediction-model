@@ -224,7 +224,7 @@ Cloned into `test/RestoMindAPI` (backend) and `test/restomind-app` (frontend).
 MongoDB; `app/integration/seed_restomind.py` seeds a restaurant+products into their Mongo;
 `app/integration/connect_restomind.py` reads those products, calls our model over HTTP, and
 writes results into their `predictions` collection in the correct schema shape. Registry
-state persists to `data/registry_state.pkl` via `REGISTRY_STORE` env var (survives restart).
+state persists to `data/registry.json` via `REGISTRY_STORE` env var (survives restart).
 **Closest-to-real simulation (`seed_bakery_history.py`):** seeds the same 11 items + 2 years
 of daily sales the model trained on into their Mongo (products carry `sku`, + 8,019
 `sales_transactions`). The connector routes SKU-linked products to the TRAINED model

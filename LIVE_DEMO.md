@@ -10,7 +10,7 @@ loop, not a mock. All figures are still SIMULATED/rule-based (no real sales hist
 |---|---|---|
 | MongoDB | `mongod --dbpath <dir> --port 27017` | 27017 |
 | RestoMind backend (NestJS) | `cd test/RestoMindAPI && npm run start` | 3000 |
-| Our model API | `REGISTRY_STORE=data/registry_state.pkl .venv/bin/uvicorn app.api.main:app --port 8200` | 8200 |
+| Our model API | `REGISTRY_STORE=data/registry.json .venv/bin/uvicorn app.api.main:app --port 8200` | 8200 |
 
 `test/RestoMindAPI/.env` is set to `DB_URL=mongodb://127.0.0.1:27017/restomind`, `PORT=3000`.
 
@@ -64,10 +64,10 @@ Verified trained-model output stored in their `predictions` (modelVersionId
 
 ## Persistence (survives restart)
 
-The model API was started with `REGISTRY_STORE=data/registry_state.pkl`. Ingesting sales
+The model API was started with `REGISTRY_STORE=data/registry.json`. Ingesting sales
 writes learned levels to that file; a fresh process reloads them:
 ```bash
-# ingest sales -> data/registry_state.pkl is written; a new RestaurantRegistry(persist_path=...)
+# ingest sales -> data/registry.json is written; a new RestaurantRegistry(persist_path=...)
 # reloads the learned level (verified: konafa level 31.3 survived a simulated restart).
 ```
 Without `REGISTRY_STORE` the registry stays in-memory (tests use this, so they're isolated).
