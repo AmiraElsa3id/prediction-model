@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +42,26 @@ class ProductState:
     learned_level: float | None = None
 
 
+# Fields where an absent value is genuinely "not provided by this caller" rather than
+# a deliberate clear. `title` is excluded: it is required on every payload, so a change
+# there is a real rename and must win. `price` defaults to 0.0 rather than None, so
+# treat 0 as "not provided" too -- a product that is actually free is not a case the
+# newsvendor economics can price anyway.
+_MERGEABLE_FIELDS = ("category", "freshness_window", "avg_daily_sales")
+
+
+def _merge_product(existing: ProductInput, incoming: ProductInput) -> ProductInput:
+    """Overlay `incoming` onto `existing`, keeping known values the caller omitted."""
+    merged = replace(existing, title=incoming.title)
+    for name in _MERGEABLE_FIELDS:
+        value = getattr(incoming, name)
+        if value is not None:
+            merged = replace(merged, **{name: value})
+    if incoming.price:
+        merged = replace(merged, price=incoming.price)
+    return merged
+
+
 @dataclass
 class RestaurantState:
     restaurant_id: str
@@ -49,11 +69,25 @@ class RestaurantState:
     history: pd.DataFrame | None = None
 
     def upsert_products(self, products: list[ProductInput]) -> None:
+        """Register or refresh products, MERGING rather than replacing.
+
+        Callers do not all know the same things. `/predict` sends one product with a
+        category and no economics; an ingest sends the catalogue with price and
+        freshness_window. Replacing the stored ProductInput wholesale meant whichever
+        call arrived last won, so a `/predict` could blank the price and shelf life a
+        prior ingest had populated -- and those two fields are what the newsvendor
+        service level q* is computed from.
+
+        So a field is only overwritten when the incoming value actually says something.
+        `None` means "I don't know", not "unset it". Clearing a field is therefore not
+        expressible here, which is the right trade: nothing upstream ever needs to.
+        """
         for p in products:
-            if p.product_id in self.products:
-                self.products[p.product_id].product = p
-            else:
+            existing = self.products.get(p.product_id)
+            if existing is None:
                 self.products[p.product_id] = ProductState(product=p)
+                continue
+            existing.product = _merge_product(existing.product, p)
 
     def ingest(self, records: pd.DataFrame) -> None:
         """Append sales rows and re-learn each product's ordinary-day level.

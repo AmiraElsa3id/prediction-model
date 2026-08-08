@@ -161,3 +161,54 @@ def test_default_registry_store_path_is_used_when_unset(tmp_path, monkeypatch):
         assert resp.status_code == 200
 
     assert (tmp_path / "data" / "registry.json").exists()
+
+
+def test_upsert_merges_rather_than_replacing():
+    """A later caller must not blank fields an earlier one populated.
+
+    `/predict` sends one product with a category and no economics; an ingest sends the
+    catalogue with price and freshness_window. Replacing wholesale meant whichever
+    arrived last won, so a predict could wipe the price and shelf life -- and those two
+    are exactly what the newsvendor q* is computed from.
+    """
+    from app.integration.registry import RestaurantState
+    from app.integration.restomind import ProductInput
+
+    state = RestaurantState(restaurant_id="R_MERGE")
+
+    # Ingest registers the full record.
+    state.upsert_products([
+        ProductInput(
+            product_id="P1", title="كرواسون", category="معجنات",
+            price=18.0, freshness_window=2.0, avg_daily_sales=40.0,
+        )
+    ])
+
+    # A predict-shaped payload: title + category only, economics unknown.
+    state.upsert_products([
+        ProductInput(product_id="P1", title="كرواسون", category="معجنات")
+    ])
+
+    kept = state.products["P1"].product
+    assert kept.price == 18.0, "price was blanked by a caller that never knew it"
+    assert kept.freshness_window == 2.0, "shelf life was blanked"
+    assert kept.avg_daily_sales == 40.0
+
+
+def test_upsert_applies_real_updates():
+    """Merging must not freeze the record -- provided values still win."""
+    from app.integration.registry import RestaurantState
+    from app.integration.restomind import ProductInput
+
+    state = RestaurantState(restaurant_id="R_MERGE2")
+    state.upsert_products([
+        ProductInput(product_id="P1", title="Old", category="bread", price=10.0)
+    ])
+    state.upsert_products([
+        ProductInput(product_id="P1", title="New", category="pastry", price=12.5)
+    ])
+
+    kept = state.products["P1"].product
+    assert kept.title == "New"          # title is always sent, so it always wins
+    assert kept.category == "pastry"
+    assert kept.price == 12.5
