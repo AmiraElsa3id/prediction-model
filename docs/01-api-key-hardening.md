@@ -50,9 +50,20 @@ deliberate, not a shortcut:
   - Use a dedicated header, not `Authorization: Bearer`, to avoid any ambiguity with
     future OAuth/JWT work and to match the existing `X-RestoMind-Key` convention already
     in this codebase.
-- Compared with `hmac.compare_digest` (constant-time), exactly as the existing
-  `_require_shared_secret` middleware already does — reuse that comparison, don't
-  reinvent it.
+- **Decided: stored and compared as a hash, not the raw key.** This mirrors how
+  today's model-provider APIs (OpenAI, Anthropic, Stripe, etc.) handle API keys: the raw
+  value is shown once at generation time and never persisted anywhere — what's stored is
+  a SHA-256 hash of it. Concretely:
+  - The env var actually deployed to this service is `API_KEY_HASH` (hex-encoded SHA-256
+    digest of the real key), not the raw `API_KEY` value.
+  - On each request, hash the incoming `X-API-Key` header value with SHA-256 and compare
+    that digest against `API_KEY_HASH` using `hmac.compare_digest` (constant-time, same
+    property the existing `_require_shared_secret` middleware already relies on — reuse
+    that comparison call, don't reinvent it).
+  - This means even if the deploy environment's config/env-var store is read by someone
+    who shouldn't have access, they get a hash, not a usable key.
+  - The raw key itself only ever needs to live on the backend side (the caller) and
+    briefly in whoever's terminal/secrets-manager generates it — see §3.3.
 
 ### 2.3 What's protected
 
@@ -84,12 +95,12 @@ New behavior:
 
 - Add `REQUIRE_API_KEY` (or reuse `ENV`/`ENVIRONMENT` if the deploy already sets one —
   check before inventing a new var). Two modes:
-  - **Dev mode** (`REQUIRE_API_KEY=false`, or unset): auth is skipped entirely if `API_KEY`
-    is also unset, so `uvicorn app.api.main:app --reload` keeps working with zero config,
-    exactly like today. This is the default for local development only.
-  - **Enforced mode** (`REQUIRE_API_KEY=true`): `API_KEY` MUST be set, and the app should
-    refuse to start (raise at import/startup time, not just 401 every request) if it
-    isn't. Fail loud at boot, not quietly at the first request someone happens to send.
+  - **Dev mode** (`REQUIRE_API_KEY=false`, or unset): auth is skipped entirely if
+    `API_KEY_HASH` is also unset, so `uvicorn app.api.main:app --reload` keeps working
+    with zero config, exactly like today. This is the default for local development only.
+  - **Enforced mode** (`REQUIRE_API_KEY=true`): `API_KEY_HASH` MUST be set, and the app
+    should refuse to start (raise at import/startup time, not just 401 every request) if
+    it isn't. Fail loud at boot, not quietly at the first request someone happens to send.
 - Whatever mechanism is chosen, the deploy config (docker-compose / k8s manifest / whatever
   ships this) must set `REQUIRE_API_KEY=true` for any environment other than a developer's
   own machine. Call this out explicitly in the PR/deploy checklist when this is built —
@@ -97,23 +108,19 @@ New behavior:
 
 ### 2.5 Consolidating with the existing `AI_SHARED_SECRET` / `X-RestoMind-Key`
 
-The RestoMind bridge already has its own narrower version of this (`main.py:74-90`,
-`X-RestoMind-Key` header, `AI_SHARED_SECRET` env var). Don't end up with two parallel auth
-schemes. Two options — pick one before implementing:
+**Decided:** remove `AI_SHARED_SECRET` entirely. It is not being kept alongside the new
+scheme, not even temporarily behind a second accepted header — `API_KEY` / `X-API-Key`
+becomes the one and only auth mechanism for this service.
 
-- **(Recommended) Replace it.** Rename to the new `API_KEY` / `X-API-Key` scheme covering
-  all routes, delete `_require_shared_secret` and its narrower path check, update
-  `RestoMindAPI`-side callers (and `app/integration/connect_restomind.py`,
-  `seed_restomind.py` if they send the old header) to send `X-API-Key` instead.
-- **(Fallback if RestoMind's client already hardcodes `X-RestoMind-Key`)** Keep both
-  headers accepted, backed by the *same* `API_KEY` value, so there's one secret to manage
-  even if two header names exist during a migration window. Treat this as temporary and
-  note a follow-up to drop the old header name once callers are updated.
-
-Either way: search the repo for `AI_SHARED_SECRET` and `X-RestoMind-Key` before starting
-so nothing is missed (`app/api/main.py`, any deploy scripts/env templates, `README.md`,
-`HANDOFF.md`, `LIVE_DEMO.md`, and anything under `app/integration/` that constructs
-outgoing requests to this service).
+- Delete `_require_shared_secret` and its narrower path check (`main.py:74-90`).
+- Update `RestoMindAPI`-side callers (and `app/integration/connect_restomind.py`,
+  `seed_restomind.py` if they send the old header) to send `X-API-Key` instead of
+  `X-RestoMind-Key`, in the same change that removes the old middleware — there is no
+  migration window where both are accepted.
+- Search the repo for `AI_SHARED_SECRET` and `X-RestoMind-Key` before starting so nothing
+  is missed (`app/api/main.py`, any deploy scripts/env templates, `.env.example`,
+  `README.md`, `HANDOFF.md`, `LIVE_DEMO.md`, and anything under `app/integration/` that
+  constructs outgoing requests to this service).
 
 ---
 
@@ -141,6 +148,15 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 # -> ~43 URL-safe base64 characters, 256 bits of entropy
 ```
 
+Then derive the `API_KEY_HASH` that actually gets deployed (§2.2) from the raw value:
+
+```bash
+python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" '<raw key>'
+```
+
+Give the raw key to the backend (§3.3) and the deploy pipeline the hash — never store the
+raw value in this service's own environment.
+
 Do not:
 - Use `uuid4()` — UUIDs are not designed as secrets and have less usable entropy than a
   raw random token of the same length.
@@ -164,14 +180,19 @@ Do not:
 
 ### 3.4 Rotation
 
-- Rotating means: generate a new key (§3.2), update it on both sides (this service's env
-  var and the backend's stored secret), redeploy this service first so it accepts the new
-  key, then update the backend to send it. A brief overlap where the service accepts only
-  the new key while the backend still sends the old one will 401 — plan the rotation as a
-  short deploy window, or (if this becomes a recurring need) extend §2.5's "accept two
-  headers" idea to "accept two valid keys during a rotation window" instead.
-- No fixed rotation schedule is being mandated by this plan — call this out as an open
-  question for whoever owns the deploy environment (see §7).
+**Decided: manual only, for now.** No automated/scheduled rotation is in scope for this
+plan — that's explicitly deferred (see §7).
+
+- Rotating means: generate a new key + hash it (§3.2), update it on both sides (this
+  service's `API_KEY_HASH` env var and the backend's stored raw secret), redeploy this
+  service first so it accepts the new key, then update the backend to send it. A brief
+  overlap where the service accepts only the new key while the backend still sends the
+  old one will 401 — plan the rotation as a short manual deploy window.
+- If rotation becomes frequent enough that this manual window is a problem, revisit
+  §2.5's "accept two headers" idea and extend it to "accept two valid key hashes during a
+  rotation window" — but that's future work, not part of this plan.
+- No fixed rotation schedule is being mandated by this plan. Rotation happens only when
+  someone manually triggers it (e.g. suspected leak, offboarding), not on a timer.
 
 ---
 
@@ -182,17 +203,19 @@ will have moved on by the time this is picked up.
 
 1. Add a small auth helper (could live in `app/api/main.py` next to the existing
    `_require_shared_secret`, or a new `app/api/auth.py` if `main.py` is getting crowded):
-   - Reads `API_KEY` and `REQUIRE_API_KEY` at import time (module-level, like the existing
-     pattern reads `AI_SHARED_SECRET` inside the middleware — either works, but reading
-     once at startup makes the "refuse to boot" behavior in §2.4 easier to implement than
-     reading per-request).
-   - Raises at import/startup if `REQUIRE_API_KEY` is true and `API_KEY` is unset or empty.
+   - Reads `API_KEY_HASH` and `REQUIRE_API_KEY` at import time (module-level, like the
+     existing pattern reads `AI_SHARED_SECRET` inside the middleware — either works, but
+     reading once at startup makes the "refuse to boot" behavior in §2.4 easier to
+     implement than reading per-request).
+   - Raises at import/startup if `REQUIRE_API_KEY` is true and `API_KEY_HASH` is unset or
+     empty.
 2. Register it as a `@app.middleware("http")` function, same shape as
    `_require_shared_secret` today, but:
    - Checks `request.url.path` against an exemption list (`{"/health"}` plus optionally
      `/docs`, `/openapi.json`, `/redoc` per the §2.3 decision) instead of a path prefix.
-   - Compares `request.headers.get("X-API-Key", "")` against `API_KEY` via
-     `hmac.compare_digest`.
+   - Hashes `request.headers.get("X-API-Key", "")` with SHA-256 and compares the resulting
+     hex digest against `API_KEY_HASH` via `hmac.compare_digest` (§2.2) — never compares
+     the raw header value directly against anything stored.
    - Returns the same `ErrorResponse` shape already used elsewhere
      (`app/api/schemas.py`'s `ErrorResponse`) on failure, status 401, so error handling
      stays consistent across the API rather than introducing a new shape.
@@ -229,13 +252,14 @@ will have moved on by the time this is picked up.
 ## 6. Docs to update once this is built
 
 - `README.md`'s env var table (currently documents `CORS_ORIGINS`,
-  `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED`, etc.) — add `API_KEY` and
-  `REQUIRE_API_KEY`, and remove `AI_SHARED_SECRET` if it's being replaced per §2.5.
+  `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED`, etc.) — add `API_KEY_HASH`
+  and `REQUIRE_API_KEY` (and note that the raw key itself is never an env var on this
+  service — see §2.2), and remove `AI_SHARED_SECRET` per §2.5 (removed, not deprecated).
 - `HANDOFF.md` §2 (env vars list) and §6 (endpoint list) — note that all routes except
-  `/health` now require `X-API-Key`.
-- Whatever deploy manifest/compose file exists — make sure `API_KEY` is documented as a
-  required secret injection, and `REQUIRE_API_KEY=true` is set for any non-local
-  environment.
+  `/health` now require `X-API-Key`, and that rotation is manual-only (§3.4).
+- Whatever deploy manifest/compose file exists — make sure `API_KEY_HASH` is documented as
+  the required secret injection (derived per §3.2, raw key never stored here), and
+  `REQUIRE_API_KEY=true` is set for any non-local environment.
 
 ---
 
