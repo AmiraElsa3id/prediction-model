@@ -11,4 +11,6 @@ they'll be built. Each plan states its own priority/status at the top.
 
 | # | Plan | Status |
 |---|------|--------|
-| 01 | [API key hardening for all endpoints](01-api-key-hardening.md) | Not started |
+| 01 | [API key hardening for all endpoints](01-api-key-hardening.md) | Implemented |
+| 02 | [Backend changes for the new API key auth](02-backend-api-key-integration.md) | Handoff doc for the RestoMind backend team — not this repo's work |
+| 03 | [CORS lockdown and cost-guard rate limiting](03-cors-and-rate-limiting.md) | Not started |
