@@ -8,6 +8,12 @@ pandas==3.0.3
 plotly==6.9.0
 pyarrow==24.0.0
 pydantic==2.13.4
+# Only needed when MONGO_URL is set (see app/integration/mongo_store.py). Imported
+# lazily there so the JSON-file / in-memory paths, including the whole test suite,
+# never require it -- but pinning it here means `pip install -r requirements.txt`
+# always has it, so setting MONGO_URL later never surprises anyone with an
+# ImportError instead of the intended ConnectionError.
+pymongo==4.17.0
 pytest==9.1.1
 scikit-learn==1.9.0
 streamlit==1.59.2

@@ -50,11 +50,24 @@ async def lifespan(app: FastAPI):
     STATE["forecast"] = service
     STATE["offers"] = OfferService()
     STATE["publisher"] = MetaPublisher()
-    # Per-restaurant learned levels. Persist by default. In-memory only when
-    # REGISTRY_STORE is explicitly "" (which is what the test suite does to
-    # stay isolated).
-    store = os.getenv("REGISTRY_STORE", "data/registry.json")
-    STATE["registry"] = RestaurantRegistry(persist_path=store or None)
+    # Per-restaurant learned levels and ingested history.
+    #
+    # MONGO_URL, when set, is authoritative: durable across a crash or redeploy,
+    # one document per restaurant, no whole-file rewrite on every ingest. This is
+    # the production path.
+    #
+    # Otherwise REGISTRY_STORE (default data/registry.json) keeps the original
+    # single-file behaviour, for local dev without a MongoDB running. In-memory
+    # only when REGISTRY_STORE is explicitly "" -- what the test suite does to
+    # stay isolated from disk state between tests.
+    mongo_url = os.getenv("MONGO_URL")
+    if mongo_url:
+        from app.integration.mongo_store import MongoRegistryStore
+        mongo_store = MongoRegistryStore(mongo_url, os.getenv("MONGO_DB", "restomind_ai"))
+        STATE["registry"] = RestaurantRegistry(store=mongo_store)
+    else:
+        json_store_path = os.getenv("REGISTRY_STORE", "data/registry.json")
+        STATE["registry"] = RestaurantRegistry(persist_path=json_store_path or None)
     yield
     STATE.clear()
 
@@ -416,8 +429,12 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
     # and left the production plan, the screen that decides how much is baked,
     # completely unchanged.
     registry: RestaurantRegistry = STATE["registry"]
+    # registry.upsert_products PERSISTS the change. Reaching into `registry.get(...)`
+    # and calling `.upsert_products` on the RestaurantState directly -- the previous
+    # form -- updates memory only, so economics sent purely through this endpoint
+    # (a restaurant that never calls /ingest) were silently lost on restart.
+    registry.upsert_products(req.restaurantId, products)
     state = registry.get(req.restaurantId)
-    state.upsert_products(products)
     levels = state.levels_for(p.product_id for p in products)
     plan = restomind.production_plan(req.restaurantId, products, req.date, levels=levels)
     return schemas.RMProductionPlanResponse(
@@ -450,10 +467,11 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
         for s in req.stock
     ]
     # Same reasoning as the production plan: a learned level decides expected
-    # sell-through, which decides whether stock is at risk at all.
+    # sell-through, which decides whether stock is at risk at all. Also same fix:
+    # go through registry.upsert_products so the economics this endpoint alone
+    # supplies are persisted, not just held in memory.
     registry: RestaurantRegistry = STATE["registry"]
-    state = registry.get(req.restaurantId)
-    state.upsert_products([
+    registry.upsert_products(req.restaurantId, [
         restomind.ProductInput(
             product_id=s.product_id, title=s.title, category=s.category,
             price=s.price, freshness_window=s.freshness_window,
@@ -462,6 +480,7 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
         )
         for s in stock
     ])
+    state = registry.get(req.restaurantId)
     levels = state.levels_for(s.product_id for s in stock)
     items = restomind.surplus_offers(
         req.restaurantId, stock, now, close_hour=req.closeHour, levels=levels
