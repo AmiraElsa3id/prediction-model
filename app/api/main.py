@@ -16,10 +16,9 @@ from contextlib import asynccontextmanager
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import auth, schemas
+from app.api import auth, ratelimit, schemas
 from app.core.items import BY_SKU
 from app.core.surplus import detect_surplus
 from app.integration import restomind
@@ -72,11 +71,22 @@ app = FastAPI(
 
 @app.middleware("http")
 async def _require_api_key(request, call_next):
-    """Gate every route except /health behind X-API-Key (docs/01-api-key-hardening.md).
+    """Gate every route except /health behind X-API-Key, then apply a blunt cost-guard
+    rate limit (docs/01-api-key-hardening.md, docs/03-cors-and-rate-limiting.md).
 
-    Replaces the old RestoMind-only shared-secret guard. Disabled (fails OPEN) only in
-    dev mode when both REQUIRE_API_KEY and API_KEY_HASH are unset, which keeps local dev
-    and the existing test suite working with zero config -- see app.api.auth.
+    Both checks live in one middleware rather than two separately-registered ones on
+    purpose: Starlette's middleware stack has the LAST-registered middleware run FIRST
+    on an incoming request (this file used to carry a whole comment block about getting
+    that backwards with CORSMiddleware, back when this service still had a CORS layer --
+    see git history). Keeping "check the key, then check the rate limit" as two
+    sequential steps inside one function sidesteps that ordering footgun entirely. Rate
+    limiting only counts requests that already passed the key check -- a bad key is
+    rejected for free without touching the counter.
+
+    No CORS layer here: this service's only legitimate caller is the backend, never a
+    browser directly (see docs/03-cors-and-rate-limiting.md §2.1, option A) -- so there
+    is no cross-origin request to accommodate, and CORSMiddleware was removed as dead
+    weight rather than narrowed.
     """
     if request.url.path not in auth.EXEMPT_PATHS:
         if auth.REQUIRE_API_KEY or auth.API_KEY_HASH:
@@ -88,25 +98,24 @@ async def _require_api_key(request, call_next):
                         detail="Missing or invalid X-API-Key",
                     ).model_dump(),
                 )
+
+        # Keyed by the presented API key so the limit is meaningful per-caller if a
+        # second key is ever introduced; degrades to per-IP in dev mode, where no key
+        # is required at all.
+        caller_id = request.headers.get("X-API-Key") or (
+            request.client.host if request.client else "unknown"
+        )
+        allowed, retry_after = ratelimit.check(caller_id, request.url.path)
+        if not allowed:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(retry_after)},
+                content=schemas.ErrorResponse(
+                    error="rate_limited",
+                    detail="Too many requests -- back off and retry later.",
+                ).model_dump(),
+            )
     return await call_next(request)
-
-
-# Allow a browser frontend to call the model directly. Defaults to the local dev
-# frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
-#
-# Registered AFTER the API key guard above -- Starlette builds its middleware stack so
-# the LAST-registered middleware becomes OUTERMOST. CORSMiddleware must be outermost
-# so it can answer OPTIONS preflights and attach Access-Control-Allow-* headers to
-# every response (including a 401 from the guard); registering it first would let the
-# guard's 401 short-circuit preflights before CORS ever ran, breaking every
-# cross-origin browser call to a protected route regardless of whether it holds the
-# correct key.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 def _service() -> ForecastService:

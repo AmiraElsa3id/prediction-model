@@ -1,6 +1,14 @@
 # 03 — CORS lockdown and cost-guard rate limiting
 
-**Status:** Not started (plan only — do not build until someone picks this up explicitly)
+**Status:** Implemented. CORS removed entirely (option A, §2.1 — confirmed: this
+service's owner context already states no browser calls it directly). Rate limiting
+built per §2.2/§3, with one deliberate deviation from the original sketch: the two
+tier limits and window are env-overridable (`RATE_LIMIT_DEFAULT_PER_MIN`,
+`RATE_LIMIT_MARKETING_PER_MIN`, `RATE_LIMIT_WINDOW_SECONDS`, all falling back to the
+hardcoded 300/20/60 defaults below if unset or invalid), not fixed code constants —
+requested during implementation so the ceiling can be tuned per-deploy without a code
+change once real traffic is observed (see §2.2's original "don't treat these as final"
+note, which this satisfies more directly).
 **Owner context:** same as `docs/01-api-key-hardening.md` — this service is an internal
 microservice. Its one legitimate caller is the backend (RestoMind's NestJS API today,
 acting **on behalf of many end users**, not calling once per human). That last point

@@ -85,6 +85,33 @@ application-level error to surface to end users. Concretely:
   key doesn't help. Retries are fine for actual transient failures (timeouts, 5xx), just
   not for 401.
 
+### 2.3a Handle 429s too — and don't make them worse
+
+The AI service also enforces a blunt, always-on rate limit on every route except
+`/health` (`docs/03-cors-and-rate-limiting.md`). This is **not** a per-user fairness
+limit — it exists purely to cap worst-case cost/abuse exposure if the backend (or a
+leaked key) sends far more traffic than a real integration ever would. A `429` response
+looks like:
+
+```json
+{"error": "rate_limited", "detail": "Too many requests -- back off and retry later."}
+```
+HTTP status `429`, with a `Retry-After` header (seconds until the limit's window resets).
+
+- Treat this the same way as a `401` (§2.3): log/alert, don't hide it behind a generic
+  error. Seeing `429`s in production likely means either real traffic has grown past the
+  current ceiling (in which case flag it to whoever owns the AI service's deployment so
+  the limit can be raised — it's configurable, not fixed) or something is sending far
+  more requests than expected (a retry loop, a bug fanning out per-item instead of using
+  a batch endpoint like `/forecast/daily-batch`).
+- **Do not blind-retry on 429 in a tight loop.** A naive retry-immediately policy is
+  exactly the failure pattern this rate limit exists to catch — retrying into an active
+  429 just keeps the backend rate-limited longer and makes the underlying problem worse,
+  not better. If retrying at all, respect `Retry-After` and back off.
+- `/marketing/generate-offer` and `/marketing/publish` have a noticeably tighter budget
+  than every other route (real per-call LLM cost / a real Facebook post) — expect 429s
+  there sooner than on `/forecast/*` if something is calling them in a loop.
+
 ### 2.4 Key rotation is manual, coordinate before it happens
 
 There is no automated rotation. When the AI service's key is rotated (see
@@ -127,6 +154,8 @@ are needed.
       behavior).
 - [ ] Add/confirm logging or alerting on 401 responses from the AI service specifically
       (§2.3), distinct from other error handling.
+- [ ] Add/confirm the same for 429 responses (§2.3a) — log/alert, respect `Retry-After`,
+      no blind tight-loop retries.
 - [ ] Note internally who to contact / what process to follow when the AI service rotates
       this key (§2.4) — this backend needs to be ready to update its stored key on short
       notice when that happens.
@@ -140,10 +169,14 @@ For context only — this is the AI service's own config, not something the back
 ```
 REQUIRE_API_KEY=false
 API_KEY_HASH=
+RATE_LIMIT_DEFAULT_PER_MIN=      # fallback 300
+RATE_LIMIT_MARKETING_PER_MIN=    # fallback 20
+RATE_LIMIT_WINDOW_SECONDS=       # fallback 60
 ```
 
 In any deployed (non-local) environment, the AI service's owner sets `REQUIRE_API_KEY=true`
 and `API_KEY_HASH=<sha256 of the raw key>`. Until that's turned on there, the AI service
 runs in dev mode and does not actually enforce the key — but backend integration code
 should send the header regardless, so nothing breaks the moment enforcement is switched
-on.
+on. The rate limit (§2.3a) is **always on** regardless of `REQUIRE_API_KEY` — there is
+no dev-mode bypass for it.

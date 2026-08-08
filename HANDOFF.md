@@ -48,11 +48,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.api.main:app           # API + Swagger at /docs (trains on startup, ~20s)
 .venv/bin/streamlit run dashboard.py         # investor dashboard
 ```
-Env vars: `COLD_START=true` (start with no history, fully rule-based), `CORS_ORIGINS` (default `http://localhost:3000`),
+Env vars: `COLD_START=true` (start with no history, fully rule-based),
 `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy + priors),
 `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing),
 `REQUIRE_API_KEY`/`API_KEY_HASH` (API key auth, see `docs/01-api-key-hardening.md`; unset in
-dev, auth is skipped; `API_KEY_HASH` is a SHA-256 hash, never the raw key).
+dev, auth is skipped; `API_KEY_HASH` is a SHA-256 hash, never the raw key),
+`RATE_LIMIT_DEFAULT_PER_MIN`/`RATE_LIMIT_MARKETING_PER_MIN`/`RATE_LIMIT_WINDOW_SECONDS`
+(cost-guard rate limit overrides, see `docs/03-cors-and-rate-limiting.md`; unset falls
+back to 300/20/60 -- not a real per-user limiter, just a ceiling against runaway cost).
+No `CORS_ORIGINS` anymore -- this service is never called from a browser directly, so
+CORSMiddleware was removed (`docs/03` §2.1) rather than configured.
 
 **Status: 79 tests passing.** Do not mark work done unless tests pass.
 
@@ -171,6 +176,10 @@ Decisions, each learned the hard way — do not "simplify" them away:
 
 All routes require `X-API-Key` except `GET /health`, once `REQUIRE_API_KEY`/`API_KEY_HASH`
 are set (see `docs/01-api-key-hardening.md`; unset in dev, so this is a no-op locally).
+Every route except `/health` also sits behind an always-on cost-guard rate limit (429 +
+`Retry-After` past the ceiling; `docs/03-cors-and-rate-limiting.md`) -- tighter on
+`/marketing/*` than everything else, and not a real per-user limiter (there's only one
+caller, the backend).
 
 Core: `GET /health`, `GET /model/status`, `POST /data/ingest`
 Forecasting: `POST /forecast/daily`, `/forecast/weekly`, `/forecast/daily-batch`

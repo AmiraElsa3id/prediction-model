@@ -115,7 +115,7 @@ model/
 │   │   └── connect_restomind.py  ← ⭐ الوصلة الحية: Mongo → الموديل → predictions
 │   └── api/
 │       ├── schemas.py            ← نماذج الإدخال/الإخراج (Pydantic)
-│       └── main.py               ← تطبيق FastAPI (16 endpoint) + CORS
+│       └── main.py               ← تطبيق FastAPI (16 endpoint) + API key + rate limit
 ├── scripts/
 │   ├── run_backtest.py           ← مقارنة الموديلات
 │   └── run_simulation.py         ← محاكاة التوفير بالجنيه

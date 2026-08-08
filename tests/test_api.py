@@ -282,32 +282,6 @@ def test_protected_routes_require_the_api_key(monkeypatch, client):
     assert client.get("/health").status_code == 200
 
 
-def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
-    """CORSMiddleware must be the outermost layer, not wrapped by the API key guard.
-
-    Starlette builds the middleware stack so the LAST-registered middleware becomes
-    OUTERMOST. If the guard is registered after CORSMiddleware (as a naive reading of
-    "insert immediately after the CORSMiddleware block" would do), the guard runs first
-    and can short-circuit an OPTIONS preflight with a 401 before CORSMiddleware ever
-    gets a chance to attach Access-Control-Allow-* headers -- which makes every
-    cross-origin browser call to a protected route fail at preflight, correct key or
-    not, since the browser never gets to see the 401 body or retry with credentials for
-    a request CORS itself rejected.
-    """
-    monkeypatch.setattr(auth, "REQUIRE_API_KEY", True)
-    monkeypatch.setattr(auth, "API_KEY_HASH", TEST_KEY_HASH)
-
-    preflight = client.options(
-        "/integration/restomind/predict",
-        headers={
-            "Origin": "http://localhost:3000",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type",
-        },
-    )
-    assert "access-control-allow-origin" in {k.lower() for k in preflight.headers.keys()}
-
-
 def test_refuses_to_boot_without_a_key_hash_when_required(monkeypatch):
     """A deploy that sets REQUIRE_API_KEY=true but forgets API_KEY_HASH must fail loudly
     at import/startup time, not silently serve every route as unauthenticated.
@@ -326,3 +300,66 @@ def test_refuses_to_boot_without_a_key_hash_when_required(monkeypatch):
         monkeypatch.setenv("REQUIRE_API_KEY", "false")
         monkeypatch.delenv("API_KEY_HASH", raising=False)
         importlib.reload(auth)
+
+
+# -- rate limiting -----------------------------------------------------------------------
+# docs/03-cors-and-rate-limiting.md: a blunt cost guard, not per-user fairness -- there is
+# exactly one legitimate caller (the backend), so this exists to cap the worst case (a
+# retry loop, a leaked key) rather than to be fair to individual end users. Tests reset
+# the shared in-memory counter and lower the limits via monkeypatch so they run fast and
+# don't leak tripped state into other tests sharing this process.
+
+from app.api import ratelimit
+
+
+def test_default_tier_rate_limit_returns_429_with_retry_after(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 3)
+
+    for _ in range(3):
+        assert client.get("/model/status").status_code == 200
+
+    limited = client.get("/model/status")
+    assert limited.status_code == 429
+    assert "retry-after" in {k.lower() for k in limited.headers.keys()}
+    assert limited.json()["error"] == "rate_limited"
+
+
+def test_marketing_tier_has_its_own_tighter_budget(monkeypatch, client):
+    """The marketing tier's limit is tracked separately from the default tier, so heavy
+    (legitimate) forecast traffic can't starve it, and vice versa.
+    """
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "MARKETING_LIMIT_PER_MIN", 2)
+
+    payload = {"sku": "CAKE_GATEAU", "discount_pct": 30}
+    for _ in range(2):
+        assert client.post("/marketing/generate-offer", json=payload).status_code == 200
+
+    limited = client.post("/marketing/generate-offer", json=payload)
+    assert limited.status_code == 429
+
+    # A different tier's budget is untouched by marketing's limit being tripped.
+    assert client.get("/model/status").status_code == 200
+
+
+def test_health_stays_exempt_from_rate_limiting(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 1)
+
+    for _ in range(5):
+        assert client.get("/health").status_code == 200
+
+
+def test_rate_limit_resets_after_the_window_elapses(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 1)
+
+    fake_now = [1_000.0]
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: fake_now[0])
+
+    assert client.get("/model/status").status_code == 200
+    assert client.get("/model/status").status_code == 429
+
+    fake_now[0] += ratelimit.WINDOW_SECONDS + 1
+    assert client.get("/model/status").status_code == 200
