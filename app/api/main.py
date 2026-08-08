@@ -379,6 +379,11 @@ def publish(req: schemas.PublishRequest) -> schemas.PublishResponse:
     return schemas.PublishResponse(**result)
 
 
+def _window(w) -> tuple[dt.date, dt.date] | None:
+    """Pydantic DateWindow -> the tuple ProductInput carries. None stays None."""
+    return None if w is None else (w.from_, w.to)
+
+
 # -- RestoMind integration bridge ----------------------------------------------------
 # Speaks the RestoMind backend's shapes so its Admin/Stores screens can consume model
 # output today, cold-start (rule-based), before sales history exists. See
@@ -401,6 +406,7 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
             product_id=p.productId, title=p.title, category=p.category,
             price=p.price, freshness_window=p.freshnessWindow,
             avg_daily_sales=p.avgDailySales,
+            avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in req.products
     ]
@@ -439,6 +445,7 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
             product_id=s.productId, title=s.title, category=s.category,
             price=s.price, freshness_window=s.freshnessWindow,
             avg_daily_sales=s.avgDailySales, current_stock=s.currentStock,
+            avg_daily_sales_window=_window(s.avgDailySalesWindow),
         )
         for s in req.stock
     ]
@@ -451,6 +458,7 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
             product_id=s.product_id, title=s.title, category=s.category,
             price=s.price, freshness_window=s.freshness_window,
             avg_daily_sales=s.avg_daily_sales,
+            avg_daily_sales_window=s.avg_daily_sales_window,
         )
         for s in stock
     ])
@@ -481,6 +489,7 @@ def rm_predict(req: schemas.RMPredictRequest) -> schemas.RMPredictResponse:
     product = restomind.ProductInput(
         product_id=req.productId, title=req.title, category=req.category,
         avg_daily_sales=req.avgDailySales,
+        avg_daily_sales_window=_window(req.avgDailySalesWindow),
     )
     # Route through the registry: if this restaurant has ingested enough sales for the
     # product, the learned level is used; otherwise it falls back to the owner estimate.
@@ -514,6 +523,7 @@ def rm_ingest(req: schemas.RMIngestRequest) -> schemas.RMIngestResponse:
         restomind.ProductInput(
             product_id=p.productId, title=p.title, category=p.category,
             price=p.price, freshness_window=p.freshnessWindow, avg_daily_sales=p.avgDailySales,
+            avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in (req.products or [])
     ]

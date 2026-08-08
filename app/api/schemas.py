@@ -319,6 +319,15 @@ class PublishResponse(BaseModel):
 # -- RestoMind integration bridge ----------------------------------------------------
 
 
+class DateWindow(BaseModel):
+    """An inclusive date range a measured average was taken over."""
+
+    from_: dt.date = Field(..., alias="from")
+    to: dt.date
+
+    model_config = {"populate_by_name": True}
+
+
 class RMProduct(BaseModel):
     """A RestoMind product, as the bridge needs it (mirrors their Product model)."""
 
@@ -330,7 +339,18 @@ class RMProduct(BaseModel):
         None, description="Shelf life in days (RestoMind Product.freshnessWindow)"
     )
     avgDailySales: float | None = Field(
-        None, description="Owner's estimate of typical daily sales; used until real data exists"
+        None, description="Typical daily sales. Must be an ORDINARY-day figure unless "
+                          "avgDailySalesWindow says otherwise."
+    )
+    avgDailySalesWindow: DateWindow | None = Field(
+        None,
+        description=(
+            "Set ONLY when avgDailySales is a mean measured over real days, giving the "
+            "window it was measured over. We divide out that window's own calendar "
+            "effect before applying the target day's -- otherwise a mean measured "
+            "during Ramadan gets the Ramadan multiplier applied a second time. Omit "
+            "for an owner's estimate, which is already an ordinary-day figure."
+        ),
     )
 
 
@@ -402,7 +422,16 @@ class RMPredictRequest(BaseModel):
     targetWeek: dt.date = Field(..., description="First day of the target week (YYYY-MM-DD)")
     category: str | None = Field(None, description="Category name (Arabic/English free text)")
     avgDailySales: float | None = Field(
-        None, description="Owner's estimate of typical daily sales; used until real data exists"
+        None, description="Typical daily sales. Must be an ORDINARY-day figure unless "
+                          "avgDailySalesWindow says otherwise."
+    )
+    avgDailySalesWindow: DateWindow | None = Field(
+        None,
+        description=(
+            "Set ONLY when avgDailySales is a mean measured over real days. See "
+            "RMProduct.avgDailySalesWindow -- without it a mean measured during "
+            "Ramadan gets the Ramadan multiplier applied twice."
+        ),
     )
     promotionActive: bool = Field(False, description="Is a discount offer live this week?")
 
