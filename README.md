@@ -120,6 +120,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | `META_PAGE_ID`, `META_ACCESS_TOKEN`, `META_PUBLISH_ENABLED` | live Meta publishing. All three required; otherwise `/marketing/publish` returns a preview. |
 | `COLD_START` | `true` starts with zero history (fully rule-based) for the cold-start demo. Default trains on the full simulated dataset. |
 | `CORS_ORIGINS` | comma-separated frontend origins allowed to call the API. Default `http://localhost:3000`; set explicitly for other deployments. |
+| `REQUIRE_API_KEY`, `API_KEY_HASH` | API key auth for every route except `/health` (see `docs/01-api-key-hardening.md`). Unset in local dev, auth is skipped. `API_KEY_HASH` is the SHA-256 hex digest of the real key, not the key itself — the raw key lives only on the caller's side. Callers send it as `X-API-Key`. Rotation is manual only for now. |
 
 ## What's needed to move beyond the POC
 

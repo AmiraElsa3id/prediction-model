@@ -1,6 +1,9 @@
 # 01 — API key hardening for all endpoints
 
-**Status:** Not started (plan only — do not build until someone picks this up explicitly)
+**Status:** Implemented (`app/api/auth.py`, `app/api/main.py`'s `_require_api_key`
+middleware, `tests/test_api.py`, `.env.example`, `README.md`/`HANDOFF.md`,
+`postman_collection.json`). Rate limiting, per-tenant credentials, CORS cleanup, and
+rotation automation remain open per §7.
 **Owner context:** this service is an internal microservice. The only intended caller is
 the backend (RestoMind's NestJS API today, possibly others later). It is not meant to be
 reachable from a browser or the public internet directly. This plan makes that assumption

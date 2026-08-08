@@ -20,6 +20,11 @@
       "key": "normalDate",
       "value": "2025-02-11",
       "type": "string"
+    },
+    {
+      "key": "apiKey",
+      "value": "",
+      "type": "string"
     }
   ],
   "item": [
@@ -700,5 +705,25 @@
         }
       ]
     }
-  ]
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "X-API-Key",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "{{apiKey}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  }
 }

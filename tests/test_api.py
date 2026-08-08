@@ -236,22 +236,27 @@ def test_weekly_batch_returns_seven_days_per_item(client):
         assert item["total_quantity"] == sum(d["recommended_quantity"] for d in item["days"])
 
 
-# -- integration auth -----------------------------------------------------------------
+# -- API key auth ----------------------------------------------------------------------
+# docs/01-api-key-hardening.md: every route except /health requires X-API-Key once
+# REQUIRE_API_KEY or API_KEY_HASH is set. auth.py reads its config at import time (so a
+# misconfigured deploy fails at boot, not at the first request -- docs §2.4/§4), so tests
+# that need the key enforced set the module's attributes directly via monkeypatch.setattr
+# rather than the env vars, and rely on monkeypatch to restore them after each test.
+
+import hashlib
+
+from app.api import auth
+
+TEST_KEY = "s3cret"
+TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
 
 
-def test_integration_routes_require_the_shared_secret(monkeypatch, client):
+def test_protected_routes_require_the_api_key(monkeypatch, client):
     """Anyone who can reach the port must not be able to poison another tenant's
-    learned demand levels via /integration/restomind/* without the shared secret.
-
-    The guard reads AI_SHARED_SECRET per request, not at app construction, so this
-    reuses the module-level `app`/`client` fixture instead of reloading the module --
-    reloading would reconstruct the shared FastAPI app singleton, which this suite
-    already knows is ordering-sensitive (see Task 3's deferred-minor note about a test
-    that re-runs the app's lifespan and mutates global registry state). monkeypatch
-    also guarantees AI_SHARED_SECRET is unset again after this test regardless of
-    whether the assertions below pass or fail, so nothing leaks into later tests.
+    learned demand levels, or use any other route, without the API key.
     """
-    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+    monkeypatch.setattr(auth, "REQUIRE_API_KEY", True)
+    monkeypatch.setattr(auth, "API_KEY_HASH", TEST_KEY_HASH)
 
     payload = {"restaurantId": "R1", "productId": "p1", "title": "X",
                "targetWeek": "2025-03-09", "avgDailySales": 10}
@@ -259,27 +264,38 @@ def test_integration_routes_require_the_shared_secret(monkeypatch, client):
     unauthenticated = client.post("/integration/restomind/predict", json=payload)
     assert unauthenticated.status_code == 401
 
+    wrong_key = client.post("/integration/restomind/predict", json=payload,
+                            headers={"X-API-Key": "not-the-key"})
+    assert wrong_key.status_code == 401
+
     ok = client.post("/integration/restomind/predict", json=payload,
-                     headers={"X-RestoMind-Key": "s3cret"})
+                     headers={"X-API-Key": TEST_KEY})
     assert ok.status_code == 200
 
-    # Non-integration routes stay open.
+    # A non-integration route is protected too -- not just the old RestoMind-only scope.
+    forecast_unauthenticated = client.post(
+        "/forecast/daily", json={"sku": "PASTRY_CROISSANT", "date": NORMAL_DAY}
+    )
+    assert forecast_unauthenticated.status_code == 401
+
+    # /health is the sole exemption.
     assert client.get("/health").status_code == 200
 
 
 def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
-    """CORSMiddleware must be the outermost layer, not wrapped by the secret guard.
+    """CORSMiddleware must be the outermost layer, not wrapped by the API key guard.
 
     Starlette builds the middleware stack so the LAST-registered middleware becomes
-    OUTERMOST. If the secret guard is registered after CORSMiddleware (as a naive
-    reading of "insert immediately after the CORSMiddleware block" would do), the
-    guard runs first and can short-circuit an OPTIONS preflight with a 401 before
-    CORSMiddleware ever gets a chance to attach Access-Control-Allow-* headers --
-    which makes every cross-origin browser call to a protected route fail at
-    preflight, correct secret or not, since the browser never gets to see the 401
-    body or retry with credentials for a request CORS itself rejected.
+    OUTERMOST. If the guard is registered after CORSMiddleware (as a naive reading of
+    "insert immediately after the CORSMiddleware block" would do), the guard runs first
+    and can short-circuit an OPTIONS preflight with a 401 before CORSMiddleware ever
+    gets a chance to attach Access-Control-Allow-* headers -- which makes every
+    cross-origin browser call to a protected route fail at preflight, correct key or
+    not, since the browser never gets to see the 401 body or retry with credentials for
+    a request CORS itself rejected.
     """
-    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+    monkeypatch.setattr(auth, "REQUIRE_API_KEY", True)
+    monkeypatch.setattr(auth, "API_KEY_HASH", TEST_KEY_HASH)
 
     preflight = client.options(
         "/integration/restomind/predict",
@@ -290,3 +306,23 @@ def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, clien
         },
     )
     assert "access-control-allow-origin" in {k.lower() for k in preflight.headers.keys()}
+
+
+def test_refuses_to_boot_without_a_key_hash_when_required(monkeypatch):
+    """A deploy that sets REQUIRE_API_KEY=true but forgets API_KEY_HASH must fail loudly
+    at import/startup time, not silently serve every route as unauthenticated.
+    """
+    import importlib
+
+    monkeypatch.setenv("REQUIRE_API_KEY", "true")
+    monkeypatch.delenv("API_KEY_HASH", raising=False)
+    try:
+        with pytest.raises(RuntimeError):
+            importlib.reload(auth)
+    finally:
+        # Restore the module to its normal (dev-mode) state so later tests -- which
+        # import `auth` as the same shared module object `main.py` already holds a
+        # reference to -- are unaffected by this test having reloaded it.
+        monkeypatch.setenv("REQUIRE_API_KEY", "false")
+        monkeypatch.delenv("API_KEY_HASH", raising=False)
+        importlib.reload(auth)

@@ -11,7 +11,6 @@ registry -- noted in the plan, deliberately out of scope here.
 from __future__ import annotations
 
 import datetime as dt
-import hmac
 import os
 from contextlib import asynccontextmanager
 
@@ -20,7 +19,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import schemas
+from app.api import auth, schemas
 from app.core.items import BY_SKU
 from app.core.surplus import detect_surplus
 from app.integration import restomind
@@ -72,34 +71,36 @@ app = FastAPI(
 )
 
 @app.middleware("http")
-async def _require_shared_secret(request, call_next):
-    """Gate the RestoMind integration routes behind a shared secret.
+async def _require_api_key(request, call_next):
+    """Gate every route except /health behind X-API-Key (docs/01-api-key-hardening.md).
 
-    These routes read and mutate per-tenant learned demand levels, so anyone who
-    could reach the port could poison another restaurant's forecasts. Disabled
-    when AI_SHARED_SECRET is unset, which keeps local dev and tests unchanged.
+    Replaces the old RestoMind-only shared-secret guard. Disabled (fails OPEN) only in
+    dev mode when both REQUIRE_API_KEY and API_KEY_HASH are unset, which keeps local dev
+    and the existing test suite working with zero config -- see app.api.auth.
     """
-    secret = os.getenv("AI_SHARED_SECRET")
-    if secret and request.url.path.startswith("/integration/restomind"):
-        if not hmac.compare_digest(request.headers.get("X-RestoMind-Key", ""), secret):
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"error": "unauthorized",
-                         "detail": "Missing or invalid X-RestoMind-Key"},
-            )
+    if request.url.path not in auth.EXEMPT_PATHS:
+        if auth.REQUIRE_API_KEY or auth.API_KEY_HASH:
+            if not auth.is_valid_key(request.headers.get("X-API-Key", "")):
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content=schemas.ErrorResponse(
+                        error="unauthorized",
+                        detail="Missing or invalid X-API-Key",
+                    ).model_dump(),
+                )
     return await call_next(request)
 
 
 # Allow a browser frontend to call the model directly. Defaults to the local dev
 # frontend origin; set CORS_ORIGINS to a comma-separated list for other deployments.
 #
-# Registered AFTER the secret guard above -- Starlette builds its middleware stack so
+# Registered AFTER the API key guard above -- Starlette builds its middleware stack so
 # the LAST-registered middleware becomes OUTERMOST. CORSMiddleware must be outermost
 # so it can answer OPTIONS preflights and attach Access-Control-Allow-* headers to
 # every response (including a 401 from the guard); registering it first would let the
 # guard's 401 short-circuit preflights before CORS ever ran, breaking every
 # cross-origin browser call to a protected route regardless of whether it holds the
-# correct secret.
+# correct key.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),

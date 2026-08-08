@@ -50,7 +50,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 Env vars: `COLD_START=true` (start with no history, fully rule-based), `CORS_ORIGINS` (default `http://localhost:3000`),
 `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy + priors),
-`META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing).
+`META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing),
+`REQUIRE_API_KEY`/`API_KEY_HASH` (API key auth, see `docs/01-api-key-hardening.md`; unset in
+dev, auth is skipped; `API_KEY_HASH` is a SHA-256 hash, never the raw key).
 
 **Status: 79 tests passing.** Do not mark work done unless tests pass.
 
@@ -166,6 +168,9 @@ Decisions, each learned the hard way — do not "simplify" them away:
 ---
 
 ## 6. Endpoints (16 routes in `app/api/main.py`)
+
+All routes require `X-API-Key` except `GET /health`, once `REQUIRE_API_KEY`/`API_KEY_HASH`
+are set (see `docs/01-api-key-hardening.md`; unset in dev, so this is a no-op locally).
 
 Core: `GET /health`, `GET /model/status`, `POST /data/ingest`
 Forecasting: `POST /forecast/daily`, `/forecast/weekly`, `/forecast/daily-batch`
