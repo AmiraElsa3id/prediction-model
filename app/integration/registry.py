@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -119,12 +120,22 @@ class RestaurantState:
             if len(quiet) >= MIN_DAYS_FOR_LEARNED:
                 st.learned_level = float(quiet["salesQty"].mean())
 
-    def _level_and_mode(self, pid: str) -> tuple[float | None, str, str]:
+    def level_for(self, pid: str) -> tuple[float | None, str, str]:
+        """`(level, mode, confidence)` for one product.
+
+        Public because every endpoint that forecasts for a restaurant needs it, not
+        just /predict. A `None` level means "no learned value, fall back to the
+        owner's estimate" — the caller decides, this only reports.
+        """
         st = self.products.get(pid)
         if st is None or st.learned_level is None:
             return None, "rule_based", "low"
         confidence = "medium" if st.observed_days >= CONFIDENT_DAYS else "low"
         return st.learned_level, "rule_based_learned", confidence
+
+    def levels_for(self, pids: Iterable[str]) -> dict[str, tuple[float | None, str, str]]:
+        """`level_for` across many products, for the batch endpoints."""
+        return {pid: self.level_for(pid) for pid in pids}
 
     def to_dict(self) -> dict:
         return {
@@ -240,7 +251,7 @@ class RestaurantRegistry:
         """Weekly prediction that uses the restaurant's learned level when available."""
         state = self.get(restaurant_id)
         state.upsert_products([product])
-        level, mode, confidence = state._level_and_mode(product.product_id)
+        level, mode, confidence = state.level_for(product.product_id)
         return predict_week(
             restaurant_id, product, week_start,
             promotion_active=promotion_active, level=level, mode=mode, confidence=confidence,

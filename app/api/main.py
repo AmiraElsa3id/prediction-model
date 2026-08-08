@@ -404,7 +404,16 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
         )
         for p in req.products
     ]
-    plan = restomind.production_plan(req.restaurantId, products, req.date)
+    # Route through the registry, like /predict does. Without this the plan ignored
+    # every sale ever ingested for this restaurant and forecast purely from the
+    # owner's estimate -- so uploading a year of history moved the prediction screen
+    # and left the production plan, the screen that decides how much is baked,
+    # completely unchanged.
+    registry: RestaurantRegistry = STATE["registry"]
+    state = registry.get(req.restaurantId)
+    state.upsert_products(products)
+    levels = state.levels_for(p.product_id for p in products)
+    plan = restomind.production_plan(req.restaurantId, products, req.date, levels=levels)
     return schemas.RMProductionPlanResponse(
         restaurantId=req.restaurantId,
         date=req.date,
@@ -433,7 +442,22 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
         )
         for s in req.stock
     ]
-    items = restomind.surplus_offers(req.restaurantId, stock, now, close_hour=req.closeHour)
+    # Same reasoning as the production plan: a learned level decides expected
+    # sell-through, which decides whether stock is at risk at all.
+    registry: RestaurantRegistry = STATE["registry"]
+    state = registry.get(req.restaurantId)
+    state.upsert_products([
+        restomind.ProductInput(
+            product_id=s.product_id, title=s.title, category=s.category,
+            price=s.price, freshness_window=s.freshness_window,
+            avg_daily_sales=s.avg_daily_sales,
+        )
+        for s in stock
+    ])
+    levels = state.levels_for(s.product_id for s in stock)
+    items = restomind.surplus_offers(
+        req.restaurantId, stock, now, close_hour=req.closeHour, levels=levels
+    )
     return schemas.RMSurplusResponse(
         restaurantId=req.restaurantId,
         checkedAt=now,
