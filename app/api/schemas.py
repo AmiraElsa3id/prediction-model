@@ -349,6 +349,10 @@ class RMPlanItem(BaseModel):
     upperBound: int
     confidence: str
     source: str
+    # Whether this quantity came from the restaurant's own sales or the owner's
+    # estimate. Without it a plan cannot be told apart from a cold-start guess.
+    levelSource: str = "owner_estimate"
+    baseDailyLevel: float = 0.0
     factors: list[Factor]
 
 

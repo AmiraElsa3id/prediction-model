@@ -124,13 +124,26 @@ def _forecast_one(
 
 def production_plan(
     restaurant_id: str, products: list[ProductInput], target_date: dt.date,
+    levels: dict[str, tuple[float | None, str, str]] | None = None,
 ) -> list[dict]:
-    """Per-product production recommendation for a restaurant on a date (rule-based)."""
+    """Per-product production recommendation for a restaurant on a date.
+
+    `levels` maps productId -> (learned_level, mode, confidence) from the registry.
+    Where a product has a level learned from that restaurant's real sales, it is used
+    in place of the owner's `avgDailySales` estimate; the calendar multiplier is
+    applied on top either way.
+
+    Passing `levels=None` keeps the old stateless behaviour (owner estimate only), so
+    a caller with no registry — the tests, and anything calling this directly — is
+    unaffected.
+    """
     feats = CALENDAR.features(target_date)
+    levels = levels or {}
     out: list[dict] = []
 
     for p in products:
-        qty, factors = _forecast_one(p, feats)
+        level, mode, confidence = levels.get(p.product_id, (None, "rule_based", "low"))
+        qty, factors = _forecast_one(p, feats, level=level)
         out.append({
             "productId": p.product_id,
             "title": p.title,
@@ -138,8 +151,14 @@ def production_plan(
             "recommendedQty": int(round(max(qty, 0))),
             "lowerBound": int(round(max(qty * INTERVAL_LOW, 0))),
             "upperBound": int(round(qty * INTERVAL_HIGH)),
-            "confidence": "low",          # cold start: rule-based, no history yet
-            "source": "rule_based",
+            "confidence": confidence,
+            "source": mode,
+            "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
+            "baseDailyLevel": round(
+                level if level is not None
+                else (p.avg_daily_sales if p.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL),
+                2,
+            ),
             "factors": factors,
         })
     return out
@@ -256,13 +275,20 @@ def to_business_time(now: dt.datetime) -> dt.datetime:
 
 def surplus_offers(
     restaurant_id: str, stock: list[StockInput], now: dt.datetime, close_hour: int = 22,
+    levels: dict[str, tuple[float | None, str, str]] | None = None,
 ) -> list[dict]:
     """Near-closing surplus per product, with a discount and Egyptian-Arabic copy.
 
     Risk = the share of current stock we do not expect to sell before closing, weighted
     by perishability (from `freshnessWindow`). Offer copy comes from the same generator
     the marketing endpoint uses (LLM + template fallback).
+
+    `levels` maps productId -> (learned_level, mode, confidence) from the registry. A
+    learned level replaces the owner's estimate when computing expected sell-through,
+    which is what decides whether stock is at risk at all — so the same ingested sales
+    that move the forecast also move the discount. `None` keeps the old behaviour.
     """
+    levels = levels or {}
     # Normalise before ANY wall-clock read: `.hour`, `.minute` and `.date()` below
     # are all compared against Cairo-local quantities.
     now = to_business_time(now)
@@ -280,9 +306,16 @@ def surplus_offers(
         # dead-slow stock that most needs discounting was given a healthy
         # expected sell-through, driving projected_surplus to 0 and skipping it
         # below. `_forecast_one` already distinguishes the two; match it.
-        base_level = (
-            s.avg_daily_sales if s.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL
-        )
+        # A level learned from this restaurant's own sales beats the owner's
+        # estimate, exactly as in _forecast_one. Both are quiet-day levels, so the
+        # calendar multiplier still applies on top.
+        learned_level, _, _ = levels.get(s.product_id, (None, "rule_based", "low"))
+        if learned_level is not None:
+            base_level = learned_level
+        else:
+            base_level = (
+                s.avg_daily_sales if s.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL
+            )
         day_level = base_level * mult
         expected_remaining = day_level * remaining_share
 

@@ -171,16 +171,24 @@ def test_default_registry_store_path_is_used_when_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("REGISTRY_STORE", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    from app.api.main import app as real_app
+    from app.api.main import STATE, app as real_app
 
-    with TestClient(real_app) as c:
-        rid, pid = "DEFAULT_R1", "DEFAULT_P1"
-        resp = c.post("/integration/restomind/ingest", json={
-            "restaurantId": rid,
-            "records": [{"date": "2025-01-06", "productId": pid, "salesQty": 5}],
-            "products": [{"productId": pid, "title": "Bread"}],
-        })
-        assert resp.status_code == 200
+    # This test runs a SECOND lifespan against the same app object, and shutdown
+    # calls STATE.clear() -- which empties the registry the module-scoped `client`
+    # fixture is still holding, so every client test after this one would 500 on a
+    # missing STATE["registry"]. Snapshot and restore so ordering cannot matter.
+    saved_state = dict(STATE)
+    try:
+        with TestClient(real_app) as c:
+            rid, pid = "DEFAULT_R1", "DEFAULT_P1"
+            resp = c.post("/integration/restomind/ingest", json={
+                "restaurantId": rid,
+                "records": [{"date": "2025-01-06", "productId": pid, "salesQty": 5}],
+                "products": [{"productId": pid, "title": "Bread"}],
+            })
+            assert resp.status_code == 200
+    finally:
+        STATE.update(saved_state)
 
     assert (tmp_path / "data" / "registry.json").exists()
 
@@ -234,3 +242,99 @@ def test_upsert_applies_real_updates():
     assert kept.title == "New"          # title is always sent, so it always wins
     assert kept.category == "pastry"
     assert kept.price == 12.5
+
+
+# -- P1: every endpoint must see ingested history, not just /predict ------------------
+
+
+def test_production_plan_uses_ingested_sales(client):
+    """The plan decides how much is baked. It must move when real sales arrive.
+
+    Before this, /integration/restomind/production-plan called the stateless bridge
+    and never consulted the registry, so a manager could upload a year of history,
+    watch the prediction screen change, and see the production plan sit exactly where
+    it was -- forecasting from the owner's estimate forever.
+    """
+    rid, pid = "PLAN_R1", "PLAN_P1"
+    product = {
+        "productId": pid, "title": "عيش بلدي", "category": "خبز",
+        "price": 2.5, "freshnessWindow": 1, "avgDailySales": 200,
+    }
+    body = {"restaurantId": rid, "date": "2025-02-10", "products": [product]}
+
+    before = client.post("/integration/restomind/production-plan", json=body).json()
+    assert before["items"][0]["levelSource"] == "owner_estimate"
+
+    # Real sales run far below the owner's 200/day guess.
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": rid,
+        "records": _sales(pid, 40, 60),
+        "products": [product],
+    })
+
+    after = client.post("/integration/restomind/production-plan", json=body).json()
+    assert after["items"][0]["levelSource"] == "learned_from_sales"
+    assert after["items"][0]["recommendedQty"] < before["items"][0]["recommendedQty"], (
+        "ingested sales did not reach the production plan"
+    )
+
+
+def test_production_plan_is_per_tenant(client):
+    """One restaurant's history must not leak into another's plan."""
+    product = {"productId": "ISO_P", "title": "كنافة", "category": "حلويات",
+               "price": 45, "freshnessWindow": 2, "avgDailySales": 100}
+
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": "ISO_A",
+        "records": _sales("ISO_P", 40, 20),
+        "products": [product],
+    })
+
+    body_b = {"restaurantId": "ISO_B", "date": "2025-02-10", "products": [product]}
+    plan_b = client.post("/integration/restomind/production-plan", json=body_b).json()
+    assert plan_b["items"][0]["levelSource"] == "owner_estimate"
+
+
+def test_surplus_offers_uses_ingested_sales(client):
+    """Expected sell-through decides whether stock is at risk, so it needs the level.
+
+    A product that really sells 15/day, held against an owner estimate of 300/day,
+    looks like it will clear everything on the shelf and is never flagged.
+    """
+    rid, pid = "SURP_R1", "SURP_P1"
+    stock_item = {
+        "productId": pid, "title": "بسبوسة", "category": "حلويات",
+        "price": 20.0, "freshnessWindow": 1, "avgDailySales": 300,
+        "currentStock": 60,
+    }
+    body = {
+        "restaurantId": rid,
+        "timestamp": "2025-02-10T20:00:00+02:00",
+        "closeHour": 22,
+        "stock": [stock_item],
+    }
+
+    before = client.post("/integration/restomind/surplus-offers", json=body).json()
+
+    client.post("/integration/restomind/ingest", json={
+        "restaurantId": rid,
+        "records": _sales(pid, 40, 15),
+        "products": [{k: v for k, v in stock_item.items() if k != "currentStock"}],
+    })
+
+    after = client.post("/integration/restomind/surplus-offers", json=body).json()
+
+    # With a true level of ~15/day this stock cannot clear, so it must now be flagged.
+    assert len(after["itemsAtRisk"]) >= len(before["itemsAtRisk"])
+    assert after["itemsAtRisk"], "learned level did not reach the surplus scan"
+
+
+def test_plan_reports_the_level_it_used(client):
+    """baseDailyLevel makes a plan auditable: which number produced this quantity."""
+    rid, pid = "PLAN_R2", "PLAN_P2"
+    product = {"productId": pid, "title": "فطير", "category": "معجنات",
+               "avgDailySales": 77, "price": 30, "freshnessWindow": 2}
+    plan = client.post("/integration/restomind/production-plan", json={
+        "restaurantId": rid, "date": "2025-02-10", "products": [product],
+    }).json()
+    assert plan["items"][0]["baseDailyLevel"] == 77
