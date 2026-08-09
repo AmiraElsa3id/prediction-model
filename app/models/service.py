@@ -73,6 +73,10 @@ class ForecastService:
         self.observed_days: dict[str, int] = {}
         self.observed_events: set[str] = set()
         self.trained_at: dt.datetime | None = None
+        # Provenance for /health: SIMULATED base comes from generate(); real rows are
+        # appended by ingest(). Tracks both halves so health can say which is true.
+        self.base_data_source: str = "none"   # "simulated" | "real" | "none"
+        self.real_ingest_rows: int = 0
 
     # -- data & training ----------------------------------------------------------
 
@@ -125,8 +129,12 @@ class ForecastService:
         nothing), items below the threshold have NO forecast -- this is the cold-start
         path a real new bakery follows until its data arrives.
         """
+        # If no raw data was passed we built the history from the simulator; that is
+        # the honesty signal /health reports. Real data passed in is marked as such.
+        _generated = raw is None
         raw = generate() if raw is None else raw
         self.history = raw.copy()
+        self.base_data_source = "simulated" if _generated else "real"
         self._recount_days()
 
         # Fit the ML model only if some item has enough history to justify it.
@@ -139,8 +147,15 @@ class ForecastService:
         self.history = None
         self.features = None
         self.observed_days = {}
+        # Critical: this is what the whole reset is for. If we only cleared the models
+        # and observed_days, a previously-trained instance would still carry its old
+        # observed_events, so the unseen-event safety net (_confidence_for_date) would
+        # wrongly trust the model on events it has never actually seen this run.
+        self.observed_events = set()
         self.point_model = self.low_model = self.high_model = None
         self.trained_at = None
+        self.base_data_source = "none"
+        self.real_ingest_rows = 0
         return self
 
     def ingest(self, records: pd.DataFrame) -> dict:
@@ -154,6 +169,11 @@ class ForecastService:
         self.history = records if self.history is None else pd.concat(
             [self.history, records], ignore_index=True
         ).drop_duplicates(subset=["date", "sku"], keep="last")
+
+        # This method is the real-data append endpoint. Record provenance so /health
+        # stops claiming SIMULATED once actuals have been posted on top of (or instead
+        # of) the generated base.
+        self.real_ingest_rows += len(records)
 
         before = {s for s, n in self.observed_days.items() if n >= self.train_threshold}
         self._recount_days()
@@ -182,6 +202,26 @@ class ForecastService:
         if self.point_model is None or self.observed_days.get(sku, 0) < self.train_threshold:
             return False
         return True
+
+    def data_source(self) -> str:
+        """Honest label for /health: which data actually feeds the model.
+
+        The service is truthful rather than aspirational here. A purely
+        simulated base reports SIMULATED; once real actuals are appended on top
+        it reports SIMULATED + REAL; a cold start fed only real actuals reports
+        REAL. The old always-SIMULATED label made /data/ingest a lie the moment
+        real data arrived. getattr guards survive pickles written before the
+        provenance fields existed.
+        """
+        real = getattr(self, "real_ingest_rows", 0)
+        base = getattr(self, "base_data_source", "none")
+        if real > 0 and base == "simulated":
+            return "SIMULATED + REAL"
+        if real > 0:
+            return "REAL"
+        if base == "simulated":
+            return "SIMULATED"
+        return "NONE"
 
     def status(self) -> dict:
         """Per-item mode report: which items have a trained model, and how close to one.

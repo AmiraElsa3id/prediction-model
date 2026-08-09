@@ -19,17 +19,29 @@ Two outputs, matching the two screens:
   * production_plan  -> Admin: how much of each product to make on a date, and why.
   * surplus_offers   -> Stores: which products are at risk near closing, with a discount
                         and Egyptian-Arabic offer copy.
+
+Trained-model routing: a product that carries a catalogue `sku` link (RestoMind
+`Product.sku`, e.g. `PASTRY_CROISSANT`) is forecast by the trained CalendarDecomposed
+model when the service is passed in -- so the admin production plan and the weekly
+prediction finally move with the calendar (Ramadan/Eid) instead of repeating a flat
+level. A product with no SKU, or a SKU the model cannot serve (unknown / below the
+training threshold), falls back to the basis level below.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
 from app.core.surplus import expected_sell_through
 from app.marketing.copy import OfferService
+from app.models.service import ModelNotReadyError
+
+if TYPE_CHECKING:
+    from app.models.service import ForecastService
 
 # Every wall-clock quantity this bridge reasons about -- `close_hour`, the
 # sell-through curve's hour index, the calendar's date -- is Cairo local time.
@@ -37,7 +49,8 @@ BUSINESS_TIMEZONE = ZoneInfo("Africa/Cairo")
 
 # Bumped whenever the bridge's prediction logic changes; stored in each prediction so
 # results stay auditable and comparable across versions (maps to RestoMind's
-# prediction.modelVersionId). Today the bridge reports basis levels only.
+# prediction.modelVersionId). Used for the basis-level fallback path; the trained path
+# stamps `calendar_decomposed/{source}` instead.
 MODEL_VERSION = "restomind-bridge/basis-v0.1"
 
 # Output margin when the bridge CAN forecast: a fixed band around the basis level.
@@ -82,9 +95,72 @@ class ProductInput:
     price: float = 0.0
     freshness_window: float | None = None   # days; RestoMind Product.freshnessWindow
     avg_daily_sales: float | None = None     # owner estimate; becomes the basis if no learned level
+    sku: str | None = None                   # catalogue link; when present and trained, the
+                                             # forecast uses the trained model instead of the basis
     # Retained for API compatibility with RestoMind payloads. Now that the bridge runs
     # basis levels and applies no calendar multiplier, windows are informational only.
     avg_daily_sales_window: tuple[dt.date, dt.date] | None = None
+
+
+def _trained_day(model: "ForecastService", sku: str, target_date: dt.date):
+    """One trained per-day forecast, or `None` when the SKU is unusable by the model.
+
+    Unknown SKU (`KeyError`) and below-the-threshold products (`ModelNotReadyError`)
+    both mean "this product has no trained model right now" -- the caller falls back to
+    the basis level instead of failing the whole request.
+    """
+    try:
+        return model.forecast(sku, target_date)
+    except (KeyError, ModelNotReadyError):
+        return None
+
+
+def _trained_week(
+    restaurant_id: str, product: ProductInput, week_start: dt.date,
+    days: list, promotion_active: bool,
+) -> dict:
+    """Shape a trained 7-day run into RestoMind's prediction document.
+
+    Mirrors `connect_restomind._predict_trained`: per-day quantities plus a `featuresUsed`
+    snapshot naming the trained model, and the strongest distinct calendar drivers as the
+    week's `factors` -- so the audit trail explains the number instead of showing [].
+    """
+    daily = [
+        {"date": d.date.isoformat(),
+         "predictedQuantity": int(d.quantity),
+         "qty": int(d.quantity),
+         "factors": d.factors}
+        for d in days
+    ]
+    total = sum(day["predictedQuantity"] for day in daily)
+
+    seen: dict[str, dict] = {}
+    for d in days:
+        for f in d.factors:
+            if f["factor"] not in seen or abs(f["impact_pct"]) > abs(seen[f["factor"]]["impact_pct"]):
+                seen[f["factor"]] = f
+    factors = sorted(seen.values(), key=lambda f: abs(f["impact_pct"]), reverse=True)
+
+    model_version = f"calendar_decomposed/{days[0].source}"
+    return {
+        "restaurantId": restaurant_id,
+        "productId": product.product_id,
+        "modelVersionId": model_version,
+        "targetWeek": week_start.isoformat(),
+        "predictedOrders": int(total),
+        "confidence": days[0].confidence,
+        "trainingMessage": None,
+        "featuresUsed": {
+            "sku": product.sku,
+            "modelVersion": model_version,
+            "mode": "calendar_decomposed",
+            "levelSource": "trained_model",
+            "promotionActive": promotion_active,
+            "calendar": _calendar_snapshot(week_start),
+        },
+        "factors": factors,
+        "dailyBreakdown": daily,
+    }
 
 
 def basis_level(p: ProductInput, level: float | None = None) -> float | None:
@@ -118,6 +194,7 @@ def _forecast_one(
 def production_plan(
     restaurant_id: str, products: list[ProductInput], target_date: dt.date,
     levels: dict[str, tuple[float | None, str, str]] | None = None,
+    model: "ForecastService | None" = None,
 ) -> list[dict]:
     """Per-product production recommendation for a restaurant on a date.
 
@@ -127,14 +204,35 @@ def production_plan(
     and no owner estimate has NO recommendation: the response carries a "still
     training" message instead of a quantity made up from priors.
 
-    Passing `levels=None` keeps the stateless behaviour (owner estimate only), so a
-    caller with no registry — the tests, and anything calling this directly — is
+    `model`, when given, upgrades products that carry a trained catalogue `sku` link:
+    they are forecast by the trained CalendarDecomposed model for `target_date`
+    (calendar-aware, with real confidence and factors). Everything else keeps the
+    basis-level behaviour below. Passing no model (or a product with no SKU) is
+    unchanged behaviour, so tests and callers that only use the stateless bridge are
     unaffected.
     """
     levels = levels or {}
     out: list[dict] = []
 
     for p in products:
+        if p.sku and model is not None:
+            trained = _trained_day(model, p.sku, target_date)
+            if trained is not None:
+                out.append({
+                    "productId": p.product_id,
+                    "title": p.title,
+                    "date": target_date.isoformat(),
+                    "recommendedQty": trained.quantity,
+                    "lowerBound": trained.lower,
+                    "upperBound": trained.upper,
+                    "confidence": trained.confidence,
+                    "source": trained.source,
+                    "levelSource": "trained_model",
+                    "baseDailyLevel": round(float(trained.quantity), 2),
+                    "factors": trained.factors,
+                    "trainingMessage": None,
+                })
+                continue
         level, mode, confidence = levels.get(p.product_id, (None, "training", "low"))
         base = basis_level(p, level)
         if base is None:
@@ -174,6 +272,7 @@ def predict_week(
     restaurant_id: str, product: ProductInput, week_start: dt.date,
     promotion_active: bool = False, level: float | None = None,
     mode: str = "training", confidence: str = "low",
+    model: "ForecastService | None" = None,
 ) -> dict:
     """Weekly prediction shaped for RestoMind's `predictions` collection.
 
@@ -182,9 +281,24 @@ def predict_week(
     across the week; the Egyptian calendar is reported in `featuresUsed.calendar` for
     auditability but no longer multiplies the number (that was the removed rule layer).
 
+    `model`, when given, upgrades a product carrying a trained catalogue `sku` link to
+    the trained CalendarDecomposed model: seven calendar-aware per-day forecasts whose
+    sum is `predictedOrders`, branded `calendar_decomposed/*` (this is exactly what
+    `connect_restomind` already did for SKU products, now inside the bridge so one call
+    serves both paths). Products without a usable trained SKU keep the basis path below.
+
     A product with no basis returns `predictedOrders: 0` and a conspicuous
     `trainingMessage` -- still training, do not order based on this.
     """
+    if product.sku and model is not None:
+        try:
+            days = model.forecast_week(product.sku, week_start)
+        except (KeyError, ModelNotReadyError):
+            days = None
+        if days is not None:
+            return _trained_week(
+                restaurant_id, product, week_start, days, promotion_active
+            )
     base = basis_level(product, level)
     if base is None:
         features_used = {

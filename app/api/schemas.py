@@ -350,6 +350,12 @@ class RMProduct(BaseModel):
             "multipliers were removed, no de-seasonalising is applied."
         ),
     )
+    sku: str | None = Field(
+        None, description="Catalogue SKU link (e.g. PASTRY_CROISSANT). When present and "
+                          "the item is trained, the production plan and predictions use "
+                          "the trained CalendarDecomposed model (calendar-aware) instead "
+                          "of the basis level."
+    )
 
 
 class RMProductionPlanRequest(BaseModel):
@@ -433,6 +439,11 @@ class RMPredictRequest(BaseModel):
             "Informational: the rule-based calendar multipliers are gone, so no "
             "de-seasonalising is applied."
         ),
+    )
+    sku: str | None = Field(
+        None, description="Catalogue SKU link; when present and trained, the prediction "
+                          "comes from the trained CalendarDecomposed model instead of "
+                          "the basis level."
     )
     promotionActive: bool = Field(False, description="Is a discount offer live this week?")
 

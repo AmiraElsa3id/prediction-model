@@ -10,9 +10,10 @@ instead of the owner's guess — so seeding sales now visually moves the predict
 
 Scope of THIS layer: multi-tenant state + data-driven LEVEL. The rule-based calendar
 multipliers the bridge once applied are gone (`rule_based.py` and `market_priors.py`
-were removed; see `HANDOFF.md` §8). Wiring the full trained `CalendarDecomposed` model
-per restaurant (which needs per-product economics calibrated off the built-in
-catalogue) is the next step — tracked in `HANDOFF.md` §9.
+were removed; see `HANDOFF.md` §8). Products carrying a trained catalogue `sku` are now
+forecast by the full trained `CalendarDecomposed` model (wired through the API);
+generalising that to arbitrary per-restaurant products (economics off the built-in
+catalogue) is tracked in `HANDOFF.md` §9.
 
 Persistence is pluggable (see `RegistryStore` in `mongo_store.py`): a JSON file
 (`JsonFileRegistryStore`, the original mechanism, kept for local dev and the
@@ -41,6 +42,7 @@ from app.integration.restomind import ProductInput, predict_week
 
 if TYPE_CHECKING:
     from app.integration.mongo_store import RegistryStore
+    from app.models.service import ForecastService
 
 # Real days a product needs before its learned level is trusted over the owner estimate.
 MIN_DAYS_FOR_LEARNED = 90
@@ -64,7 +66,7 @@ class ProductState:
 # there is a real rename and must win. `price` defaults to 0.0 rather than None, so
 # treat 0 as "not provided" too -- a product that is actually free is not a case the
 # newsvendor economics can price anyway.
-_MERGEABLE_FIELDS = ("category", "freshness_window", "avg_daily_sales")
+_MERGEABLE_FIELDS = ("category", "freshness_window", "avg_daily_sales", "sku")
 
 
 def _merge_product(existing: ProductInput, incoming: ProductInput) -> ProductInput:
@@ -172,6 +174,7 @@ class RestaurantState:
                         "price": st.product.price,
                         "freshness_window": st.product.freshness_window,
                         "avg_daily_sales": st.product.avg_daily_sales,
+                        "sku": st.product.sku,
                     },
                     "observed_days": st.observed_days,
                     "learned_level": st.learned_level,
@@ -349,15 +352,20 @@ class RestaurantRegistry:
 
     def predict_week(
         self, restaurant_id: str, product: ProductInput, week_start: dt.date,
-        promotion_active: bool = False,
+        promotion_active: bool = False, model: "ForecastService | None" = None,
     ) -> dict:
-        """Weekly prediction that uses the restaurant's learned level when available."""
+        """Weekly prediction that uses the restaurant's learned level when available.
+
+        `model`, when given, lets the bridge route products with a trained catalogue
+        `sku` link through the trained CalendarDecomposed model instead of the level.
+        """
         self.upsert_products(restaurant_id, [product])
         state = self.get(restaurant_id)
         level, mode, confidence = state.level_for(product.product_id)
         return predict_week(
             restaurant_id, product, week_start,
             promotion_active=promotion_active, level=level, mode=mode, confidence=confidence,
+            model=model,
         )
 
     def status(self, restaurant_id: str) -> dict:

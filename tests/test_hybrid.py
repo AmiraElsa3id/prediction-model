@@ -89,6 +89,38 @@ def test_forecast_all_raises_model_not_ready_while_training():
         svc.forecast_all(NORMAL_DAY, ["PASTRY_CROISSANT"])
 
 
+def test_start_cold_wipes_previously_seen_events(full):
+    """start_cold() must fully reset, including observed_events.
+
+    Before this fix the reset cleared models/observed_days but left observed_events
+    from an earlier training behind, so the unseen-event safety net wrongly trusted
+    the model on events this run never trained on.
+    """
+    d0 = full["date"].min()
+    svc = ForecastService(train_threshold=90).start_cold()
+    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=400)])
+    assert "is_ramadan" in svc.observed_events
+    svc.start_cold()
+    assert svc.observed_events == set()
+    assert svc.observed_days == {}
+
+
+def test_data_source_is_honest_about_real_ingest(full):
+    """/health provenance: never call generated data SIMULATED once real actuals
+    have been appended, and never claim SIMULATED for a pure cold-start+ingest."""
+    d0 = full["date"].min()
+
+    cold = ForecastService(train_threshold=90).start_cold()
+    assert cold.data_source() == "NONE"
+    cold.ingest(full[full["date"] < d0 + pd.Timedelta(days=10)])
+    assert cold.data_source() == "REAL"
+
+    mixed = ForecastService(train_threshold=90).train()
+    assert mixed.data_source() == "SIMULATED"
+    mixed.ingest(full[full["date"] < d0 + pd.Timedelta(days=10)])
+    assert mixed.data_source() == "SIMULATED + REAL"
+
+
 def test_status_reports_progress_towards_trained():
     """status() keeps driving a per-item progress bar, now toward 'trained'."""
     svc = ForecastService(train_threshold=90).start_cold()

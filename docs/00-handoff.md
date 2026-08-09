@@ -203,7 +203,7 @@ Alerts/surplus/marketing: `POST /alerts/waste-prevention`, `/surplus/detect`,
 Every forecast response carries `confidence`, `source` (batch), interval, and `factors`
 (calendar attribution) — the explanation is what makes managers trust it.
 
-Tests (**107 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
+Tests (**117 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
 (effect recovery), `test_forecaster` (decomposition anticipates Ramadan, beats naive),
 `test_hybrid` (threshold gate: no forecast while training, then model), `test_api` (all
 endpoints), `test_restomind_bridge` (basis-level bridge + timezone), `test_registry`
@@ -296,8 +296,11 @@ moderate effort. City/weather = optional. Hyper-local = learned from data automa
    `sales_transactions` and feeds `/data/ingest` so seeding real data actually moves the model.
 3. **Multi-tenant model registry** — PARTIALLY DONE: `integration/registry.py` keys
    state by `restaurantId` and learns the per-product demand LEVEL from ingested sales.
-   Remaining: wire the full trained `CalendarDecomposed` model per restaurant (needs
-   per-product economics generalised off the built-in catalogue).
+   The trained `CalendarDecomposed` model is now routed into the RestoMind screens too:
+   a product carrying a catalogue `sku` is forecast by the trained model in
+   `/integration/restomind/production-plan` and `/integration/restomind/predict`.
+   Remaining: generalised per-restaurant economics so arbitrary (non-catalogue) products
+   get a trained forecast of their own, not only the 11 built-in SKUs.
 4. **Ingredient-level forecasting** — use `Recipe` (bill of materials) to convert product
    demand → ingredient purchasing forecast; use `freshnessWindow`/`shelfLifeDays` instead of
    hardcoded shelf life. Unlocks à-la-carte restaurants (waste is at ingredient level).

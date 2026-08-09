@@ -67,6 +67,52 @@ def test_production_plan_with_no_basis_returns_training_message(client):
     assert item["source"] == "training"
 
 
+def test_production_plan_uses_trained_model_for_sku_product(client):
+    """A product with a trained catalogue SKU gets the real model, not the flat level.
+
+    The trained CalendarDecomposed model is calendar-aware: the plan for the same
+    product must differ between a normal day and Ramadan, and must agree exactly with
+    /forecast/daily (they are the same call).
+    """
+    product = {"productId": "p_croissant", "title": "كرواسون", "category": "معجنات",
+               "price": 18, "freshnessWindow": 2, "avgDailySales": 180,
+               "sku": "PASTRY_CROISSANT"}
+    plan = client.post("/integration/restomind/production-plan",
+                       json={"restaurantId": "R1", "date": "2025-02-11",
+                             "products": [product]}).json()["items"][0]
+    assert plan["levelSource"] == "trained_model"
+    assert plan["source"] == "batch"
+    assert plan["trainingMessage"] is None
+
+    daily = client.post("/forecast/daily", json={"sku": "PASTRY_CROISSANT",
+                                                 "date": "2025-02-11"}).json()
+    assert plan["recommendedQty"] == daily["recommended_quantity"]
+    assert plan["lowerBound"] == daily["lower_bound"]
+    assert plan["upperBound"] == daily["upper_bound"]
+    assert plan["confidence"] == daily["confidence"]
+
+    ramadan = client.post("/integration/restomind/production-plan",
+                          json={"restaurantId": "R1", "date": "2025-03-15",
+                                "products": [product]}).json()["items"][0]
+    assert ramadan["recommendedQty"] != plan["recommendedQty"], (
+        "a trained product's plan must move with the calendar (Ramadan)"
+    )
+
+
+def test_production_plan_unknown_sku_falls_back_to_owner_estimate(client):
+    """An unusable SKU must not break the plan; it degrades to the basis level."""
+    product = {"productId": "p_flat", "title": "توست", "category": "مخبوزات",
+               "price": 10, "freshnessWindow": 1, "avgDailySales": 100,
+               "sku": "NOT_A_THING"}
+    r = client.post("/integration/restomind/production-plan",
+                    json={"restaurantId": "R1", "date": "2025-02-11",
+                          "products": [product]})
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["levelSource"] == "owner_estimate"
+    assert item["recommendedQty"] == 100
+
+
 def test_surplus_offers_flags_risk_and_writes_arabic_copy(client):
     stock = [{**p, "currentStock": cs} for p, cs in zip(PRODUCTS, [40, 25, 150])]
     r = client.post("/integration/restomind/surplus-offers",
@@ -190,6 +236,26 @@ def test_predict_weekly_total_equals_daily_sum(client):
         "category": "معجنات", "targetWeek": "2025-02-10", "avgDailySales": 180,
     }).json()
     assert r["predictedOrders"] == sum(d["predictedQuantity"] for d in r["dailyBreakdown"])
+
+
+def test_predict_uses_trained_week_for_sku_product(client):
+    """A product with a trained SKU gets the calendar-aware trained week.
+
+    The response is branded `calendar_decomposed/*`, carries real calendar factors
+    (not []), and reconciles: predictedOrders == sum of the 7 days.
+    """
+    r = client.post("/integration/restomind/predict", json={
+        "restaurantId": "R1", "productId": "Pk", "title": "كنافة",
+        "category": "حلويات", "targetWeek": "2025-03-10", "avgDailySales": 40,
+        "sku": "SWEET_KONAFA",
+    }).json()
+    assert r["modelVersionId"].startswith("calendar_decomposed/")
+    assert r["featuresUsed"]["levelSource"] == "trained_model"
+    assert r["featuresUsed"]["mode"] == "calendar_decomposed"
+    assert r["confidence"] in ("high", "medium", "low")
+    assert len(r["dailyBreakdown"]) == 7
+    assert r["predictedOrders"] == sum(d["predictedQuantity"] for d in r["dailyBreakdown"])
+    assert r["trainingMessage"] is None
 
 
 def test_zero_avg_daily_sales_is_respected_not_replaced_by_default():

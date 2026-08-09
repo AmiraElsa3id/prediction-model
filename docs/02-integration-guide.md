@@ -92,6 +92,8 @@ Content-Type: application/json
 
 **ملحوظة:** بيجيب الرقم من `baseDailyLevel` (تقدير المالك أو مستوى متعلّم من مبيعات حقيقية بـ `/integration/restomind/ingest`). لو المنتج مفيش له أي أساس (لا مستوى متعلّم ولا `avgDailySales`)، هيرجع `predictedOrders: 0` مع رسالة `trainingMessage` توضح إنه لسه بيتدرّب — مش رقم مخمن من قواعد.
 
+**لو المنتج عليه `sku` كاتالوجي مدرب** (مثل `PASTRY_CROISSANT`): الرد بييجي من الموديل المتدرّب `CalendarDecomposed` (واعي بالرمزضان/العيد) — `modelVersionId` يبدأ بـ `calendar_decomposed/...`، `levelSource: "trained_model"`، وفيه `factors` حقيقية بدل `[]`.
+
 **الباك بياخد الرد ده ويخزّنه** في `predictions` كده (المفاتيح متطابقة تقريبًا):
 `restaurantId, productId, modelVersionId, targetWeek, predictedOrders, featuresUsed, actualOrders:null`.
 
@@ -104,7 +106,8 @@ POST {AI_SERVICE_URL}/integration/restomind/production-plan
   "date": "2025-03-15",
   "products": [
     { "productId":"p1", "title":"كرواسون", "category":"معجنات",
-      "price":18, "freshnessWindow":2, "avgDailySales":180 }
+      "price":18, "freshnessWindow":2, "avgDailySales":180,
+      "sku":"PASTRY_CROISSANT" }   // اختياري: لو موجود ومدرب، الخطة من الموديل المتدرّب
   ]
 }
 ```

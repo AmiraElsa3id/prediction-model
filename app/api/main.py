@@ -142,6 +142,15 @@ def _service() -> ForecastService:
     return service
 
 
+def _trained_model() -> ForecastService | None:
+    """The trained model, or None when the service is not up (e.g. cold start).
+
+    The RestoMind bridge uses this to route SKU-linked products through the trained
+    CalendarDecomposed model; a missing/untrained model degrades to the basis level.
+    """
+    return STATE.get("forecast")
+
+
 @app.exception_handler(KeyError)
 async def _key_error_handler(request, exc: KeyError) -> JSONResponse:
     return JSONResponse(
@@ -184,7 +193,7 @@ def health() -> dict:
         "status": "ok" if service else "training",
         "model_trained_at": service.trained_at.isoformat() if service and service.trained_at else None,
         "known_skus": len(BY_SKU),
-        "data_source": "SIMULATED",
+        "data_source": service.data_source() if service else "NONE",
     }
 
 
@@ -452,7 +461,7 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
         restomind.ProductInput(
             product_id=p.productId, title=p.title, category=p.category,
             price=p.price, freshness_window=p.freshnessWindow,
-            avg_daily_sales=p.avgDailySales,
+            avg_daily_sales=p.avgDailySales, sku=p.sku,
             avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in req.products
@@ -470,7 +479,9 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
     registry.upsert_products(req.restaurantId, products)
     state = registry.get(req.restaurantId)
     levels = state.levels_for(p.product_id for p in products)
-    plan = restomind.production_plan(req.restaurantId, products, req.date, levels=levels)
+    plan = restomind.production_plan(
+        req.restaurantId, products, req.date, levels=levels, model=_trained_model()
+    )
     return schemas.RMProductionPlanResponse(
         restaurantId=req.restaurantId,
         date=req.date,
@@ -537,19 +548,24 @@ def rm_predict(req: schemas.RMPredictRequest) -> schemas.RMPredictResponse:
     This is what their Phase-5 AI pipeline calls: it returns `predictedOrders` for a
     `targetWeek` plus a `featuresUsed` snapshot, mapping straight onto their prediction
     document. The number is the product's basis level (learned from that restaurant's
-    real sales if present, else the owner's estimate). A product with no basis gets
-    `predictedOrders: 0` with a `trainingMessage` -- still training, not a guess.
+    real sales if present, else the owner's estimate) -- unless the product carries a
+    trained catalogue `sku` link, in which case the trained CalendarDecomposed model
+    produces the week. A product with no basis gets `predictedOrders: 0` with a
+    `trainingMessage` -- still training, not a guess.
     """
     product = restomind.ProductInput(
         product_id=req.productId, title=req.title, category=req.category,
-        avg_daily_sales=req.avgDailySales,
+        avg_daily_sales=req.avgDailySales, sku=req.sku,
         avg_daily_sales_window=_window(req.avgDailySalesWindow),
     )
     # Route through the registry: if this restaurant has ingested enough sales for the
     # product, the learned level is used; otherwise it falls back to the owner estimate.
+    # The trained model is passed in so SKU-linked products get the real calendar-aware
+    # week instead of the flat level.
     registry: RestaurantRegistry = STATE["registry"]
     out = registry.predict_week(
-        req.restaurantId, product, req.targetWeek, promotion_active=req.promotionActive
+        req.restaurantId, product, req.targetWeek,
+        promotion_active=req.promotionActive, model=_trained_model(),
     )
     out["factors"] = [schemas.Factor(**f) for f in out["factors"]]
     return schemas.RMPredictResponse(**out)
