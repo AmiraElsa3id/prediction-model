@@ -1,4 +1,5 @@
-"""FastAPI microservice exposing the forecasting and surplus-marketing endpoints.
+"""FastAPI microservice exposing the forecasting, surplus-detection, and RestoMind
+bridge endpoints.
 
 Run:  .venv/bin/uvicorn app.api.main:app --reload
 Docs: http://127.0.0.1:8000/docs
@@ -22,8 +23,6 @@ from app.api import auth, ratelimit, schemas
 from app.core.surplus import detect_surplus
 from app.integration import restomind
 from app.integration.registry import RestaurantRegistry
-from app.marketing.copy import OfferService
-from app.marketing.publisher import MetaPublisher
 from app.models.service import ForecastService, ModelNotReadyError
 
 STATE: dict = {}
@@ -34,37 +33,53 @@ async def lifespan(app: FastAPI):
     """Prepare the service on startup so the first request is not the one that pays.
 
     Two start modes, chosen by the COLD_START env var:
-      * default        -- load the full (simulated) history and train, as before. Every
-                          item is already past the threshold, so all use the model.
-      * COLD_START=true -- start with zero history. Every item is untrained until data
-                          is posted to /data/ingest. This is the cold-start demo path:
-                          until an item reaches the threshold there is NO forecast.
+      * default (COLD_START unset or true) -- start with zero history. Every item is
+                          untrained until data is posted to /data/ingest. Until an item
+                          reaches the threshold there is NO forecast for it.
+      * COLD_START=false -- load app/core/generate.py's two years of SIMULATED bakery
+                          history and train on it.
+
+    The default is deliberately the cold path. Booting on simulated data made /health
+    report `"data_source": "SIMULATED"` and 11 fictional SKUs on a service that a real
+    backend was already talking to -- a number nobody asked for, presented exactly like
+    a measured one. Serving synthetic figures now takes an explicit opt-in.
+
+    Note `dashboard.py` and the test suite still call `ForecastService.train()` with no
+    argument and so still get the generated dataset. That is intended: they exist to
+    exercise the model, and are not endpoints anything integrates against.
     """
     service = ForecastService(horizon=1)
-    if os.getenv("COLD_START", "false").lower() == "true":
+    if os.getenv("COLD_START", "true").lower() == "true":
         service.start_cold()
     else:
         service.train()
     STATE["forecast"] = service
-    STATE["offers"] = OfferService()
-    STATE["publisher"] = MetaPublisher()
-    # Per-restaurant learned levels and ingested history.
+    # Per-restaurant learned levels and ingested history. Three configurations:
     #
-    # MONGO_URL, when set, is authoritative: durable across a crash or redeploy,
-    # one document per restaurant, no whole-file rewrite on every ingest. This is
-    # the production path.
+    #   MONGO_URL + REGISTRY_STORE -> Mongo is authoritative, the JSON file is a
+    #       best-effort mirror (DualRegistryStore). Durable AND readable by eye.
+    #   MONGO_URL alone            -> Mongo only. The production path: one document
+    #       per restaurant, no whole-file rewrite on every ingest.
+    #   REGISTRY_STORE alone       -> the original single-file behaviour, for local
+    #       dev without a MongoDB running.
     #
-    # Otherwise REGISTRY_STORE (default data/registry.json) keeps the original
-    # single-file behaviour, for local dev without a MongoDB running. In-memory
-    # only when REGISTRY_STORE is explicitly "" -- what the test suite does to
-    # stay isolated from disk state between tests.
+    # In-memory only when REGISTRY_STORE is explicitly "" and MONGO_URL is unset --
+    # what the test suite does to stay isolated from disk state between tests.
     mongo_url = os.getenv("MONGO_URL")
+    json_store_path = os.getenv("REGISTRY_STORE", "data/registry.json")
     if mongo_url:
-        from app.integration.mongo_store import MongoRegistryStore
+        from app.integration.mongo_store import DualRegistryStore, MongoRegistryStore
+        from app.integration.registry import JsonFileRegistryStore
         mongo_store = MongoRegistryStore(mongo_url, os.getenv("MONGO_DB", "restomind_ai"))
-        STATE["registry"] = RestaurantRegistry(store=mongo_store)
+        if json_store_path:
+            # Both configured: Mongo is authoritative, the JSON file is a best-effort
+            # mirror you can open and read. A mirror failure never fails a request.
+            STATE["registry"] = RestaurantRegistry(
+                store=DualRegistryStore(mongo_store, JsonFileRegistryStore(json_store_path))
+            )
+        else:
+            STATE["registry"] = RestaurantRegistry(store=mongo_store)
     else:
-        json_store_path = os.getenv("REGISTRY_STORE", "data/registry.json")
         STATE["registry"] = RestaurantRegistry(persist_path=json_store_path or None)
     yield
     STATE.clear()
@@ -75,7 +90,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
     description=(
-        "Demand forecasting and automated surplus marketing for Egyptian bakeries.\n\n"
+        "Demand forecasting and automated surplus detection for Egyptian bakeries.\n\n"
         "**All forecasts in this POC are trained on SIMULATED data.** Figures are "
         "projections from a generated dataset with assumed unit economics, not "
         "measurements from a real bakery."
@@ -433,50 +448,15 @@ def surplus_detect(req: schemas.SurplusRequest) -> schemas.SurplusResponse:
     )
 
 
-# -- marketing -----------------------------------------------------------------------
-
-
-@app.post("/marketing/generate-offer", response_model=schemas.OfferResponse, tags=["marketing"])
-def generate_offer(req: schemas.OfferRequest) -> schemas.OfferResponse:
-    """Generate promotional copy in Egyptian Arabic dialect.
-
-    Uses an LLM when configured and validated, otherwise hand-written templates. The
-    `generator` field reports which one actually produced the text.
-    """
-    offers: OfferService = STATE["offers"]
-    service = _service()
-    try:
-        offer = offers.build(req.sku, req.discount_pct, req.close_time,
-                             catalogue=service.catalogue)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    return schemas.OfferResponse(**offer.__dict__)
-
-
-@app.post("/marketing/publish", response_model=schemas.PublishResponse, tags=["marketing"])
-def publish(req: schemas.PublishRequest) -> schemas.PublishResponse:
-    """Publish an offer to Facebook/Instagram.
-
-    Defaults to `dry_run=true`, returning a rendered preview without contacting Meta.
-    Live publishing writes to a real public page under the bakery's brand, so it must
-    be opted into explicitly and requires Meta credentials to be configured.
-    """
-    publisher: MetaPublisher = STATE["publisher"]
-    result = publisher.publish(
-        sku=req.sku, copy_ar=req.copy_ar, platforms=req.platforms, dry_run=req.dry_run
-    )
-    return schemas.PublishResponse(**result)
+# -- RestoMind integration bridge ----------------------------------------------------
+# Speaks the RestoMind backend's shapes so its Admin/Stores screens can consume model
+# output today (owner estimate or a learned level) before the trained pipeline exists.
+# See app/integration/restomind.py.
 
 
 def _window(w) -> tuple[dt.date, dt.date] | None:
     """Pydantic DateWindow -> the tuple ProductInput carries. None stays None."""
     return None if w is None else (w.from_, w.to)
-
-
-# -- RestoMind integration bridge ----------------------------------------------------
-# Speaks the RestoMind backend's shapes so its Admin/Stores screens can consume model
-# output today (owner estimate or a learned level) before the trained pipeline exists.
-# See app/integration/restomind.py.
 
 
 @app.post(
