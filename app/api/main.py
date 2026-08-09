@@ -13,7 +13,34 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+
+def _load_local_env() -> None:
+    """Load simple KEY=VALUE pairs from the project .env for local uvicorn runs."""
+    if "pytest" in sys.modules:
+        return
+
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if os.getenv("REGISTRY_STORE") == "" and key.startswith("MONGO_"):
+            continue
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_local_env()
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, status
