@@ -13,6 +13,13 @@ Scope of THIS layer: multi-tenant state + data-driven LEVEL (still rule-based fo
 calendar shape). Wiring the full trained `CalendarDecomposed` model per restaurant (which
 needs per-product economics generalised off the built-in catalogue) is the next step —
 tracked in HANDOFF.md §9.
+
+Persistence is pluggable (see `RegistryStore` in `mongo_store.py`): a JSON file
+(`JsonFileRegistryStore`, below -- the original mechanism, kept for local dev and the
+test suite) or MongoDB (`MongoRegistryStore` -- the durable option, one document per
+restaurant, immune to the JSON file's whole-corpus rewrite on every save). Which one is
+wired up is `app/api/main.py`'s decision; this module only knows the `RegistryStore`
+protocol.
 """
 
 from __future__ import annotations
@@ -22,11 +29,15 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from app.core.egypt_calendar import CALENDAR
 from app.integration.restomind import ProductInput, map_category, predict_week
+
+if TYPE_CHECKING:
+    from app.integration.mongo_store import RegistryStore
 
 # Real days a product needs before its learned level is trusted over the owner estimate.
 MIN_DAYS_FOR_LEARNED = 14
@@ -186,39 +197,90 @@ class RestaurantState:
         return state
 
 
-class RestaurantRegistry:
-    """Holds `RestaurantState` per restaurantId. In-memory (POC); a real deployment
-    persists this per tenant."""
+class JsonFileRegistryStore:
+    """The original persistence mechanism: every restaurant's state in one JSON file.
 
-    def __init__(self, persist_path: str | Path | None = None) -> None:
-        self._states: dict[str, RestaurantState] = {}
-        self.persist_path = Path(persist_path) if persist_path else None
-        if self.persist_path and self.persist_path.exists():
-            self._load()
+    Kept for local development (no MongoDB required) and for the test suite, which
+    needs a store that does not depend on external infrastructure. `save_restaurant`
+    still has to rewrite the whole file -- that is the nature of a single JSON file,
+    not something this class can avoid -- which is exactly the cost `MongoRegistryStore`
+    removes. Prefer Mongo for anything that is not local dev or tests.
+    """
 
-    def _load(self) -> None:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def load_all(self) -> dict[str, dict]:
+        if not self.path.exists():
+            return {}
         # JSON, not pickle: this file is read at startup, and unpickling is
         # arbitrary code execution if anything can write to that path.
         try:
-            raw = json.loads(self.persist_path.read_text(encoding="utf-8"))
-            self._states = {
-                rid: RestaurantState.from_dict(s) for rid, s in raw.items()
-            }
+            return json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
-            self._states = {}   # corrupt/old file -> start fresh rather than crash
+            return {}   # corrupt/old file -> start fresh rather than crash
 
-    def _save(self) -> None:
-        if not self.persist_path:
-            return
-        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+    def save_restaurant(self, restaurant_id: str, doc: dict) -> None:
+        # No partial write is possible in a single JSON file: read the current whole
+        # state, replace one restaurant's entry, write the whole thing back. This is
+        # the write-amplification MongoRegistryStore exists to remove.
+        current = self.load_all()
+        current[restaurant_id] = doc
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must not leave a truncated store behind.
-        tmp = self.persist_path.with_suffix(self.persist_path.suffix + ".tmp")
-        payload = {rid: st.to_dict() for rid, st in self._states.items()}
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.persist_path)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.path)
+
+
+class RestaurantRegistry:
+    """Holds `RestaurantState` per restaurantId, durable across restarts.
+
+    Pass `store=` a `RegistryStore` (typically `MongoRegistryStore`) for production
+    persistence, or `persist_path=` for the JSON-file mechanism (local dev / tests).
+    Passing neither keeps state in memory only, for tests that want isolation from any
+    backing store at all.
+    """
+
+    def __init__(
+        self,
+        persist_path: str | Path | None = None,
+        store: "RegistryStore | None" = None,
+    ) -> None:
+        self._states: dict[str, RestaurantState] = {}
+        self.store = store or (JsonFileRegistryStore(persist_path) if persist_path else None)
+        if self.store:
+            self._load()
+
+    def _load(self) -> None:
+        raw = self.store.load_all()
+        self._states = {rid: RestaurantState.from_dict(s) for rid, s in raw.items()}
+
+    def _save(self, restaurant_id: str) -> None:
+        """Persist ONE restaurant. Every method that mutates a RestaurantState calls
+        this with that restaurant's id -- so a metadata-only update (a /predict or
+        /production-plan call upserting a product, with no new sales rows) is durable
+        too, not just a full /ingest. Before this, only `ingest()` saved, so calling
+        /production-plan or /surplus-offers for a restaurant that had never called
+        /ingest left its economics unpersisted -- present in memory, gone on restart.
+        """
+        if not self.store:
+            return
+        self.store.save_restaurant(restaurant_id, self._states[restaurant_id].to_dict())
 
     def get(self, restaurant_id: str) -> RestaurantState:
         return self._states.setdefault(restaurant_id, RestaurantState(restaurant_id))
+
+    def upsert_products(self, restaurant_id: str, products: list[ProductInput]) -> None:
+        """Register or refresh products for a restaurant, and persist the change.
+
+        The entry point `/predict`, `/production-plan` and `/surplus-offers` should all
+        use instead of reaching into `get(...).upsert_products(...)` directly -- that
+        form mutates in memory only, silently skipping persistence.
+        """
+        state = self.get(restaurant_id)
+        state.upsert_products(products)
+        self._save(restaurant_id)
 
     def ingest(
         self, restaurant_id: str, records: pd.DataFrame,
@@ -232,7 +294,7 @@ class RestaurantRegistry:
             if pid not in state.products:
                 state.upsert_products([ProductInput(product_id=pid, title=pid)])
         state.ingest(records)
-        self._save()
+        self._save(restaurant_id)
         return {
             "restaurantId": restaurant_id,
             "rowsIngested": int(len(records)),
@@ -249,8 +311,8 @@ class RestaurantRegistry:
         promotion_active: bool = False,
     ) -> dict:
         """Weekly prediction that uses the restaurant's learned level when available."""
+        self.upsert_products(restaurant_id, [product])
         state = self.get(restaurant_id)
-        state.upsert_products([product])
         level, mode, confidence = state.level_for(product.product_id)
         return predict_week(
             restaurant_id, product, week_start,
