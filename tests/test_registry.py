@@ -82,6 +82,28 @@ def test_registry_status_reports_learned_products(client):
     assert st["items"][0]["learnedLevel"] is not None
 
 
+def test_status_reports_its_own_thresholds(client):
+    """RestoMind draws a per-product progress bar from these.
+
+    It used to hardcode `MIN_DAYS_FOR_LEARNED = 14` on its own side, so tuning the
+    threshold here silently made that bar wrong. The numbers belong to this module,
+    so the endpoint states them rather than leaving the caller to guess.
+    """
+    from app.integration.registry import (
+        CONFIDENT_DAYS,
+        MIN_DAYS_FOR_LEARNED,
+        QUIET_WINDOW,
+    )
+
+    st = client.get("/integration/restomind/status/REG_THRESHOLDS").json()
+    assert st["minDaysForLearned"] == MIN_DAYS_FOR_LEARNED
+    assert st["quietWindowDays"] == QUIET_WINDOW
+    assert st["confidentDays"] == CONFIDENT_DAYS
+    # Reported even for a restaurant with no data at all -- the progress bar has
+    # to render on day zero too.
+    assert st["productsTracked"] == 0
+
+
 def test_registry_survives_a_restart(tmp_path):
     """Learned levels must outlive the process, or a redeploy resets every tenant.
 
