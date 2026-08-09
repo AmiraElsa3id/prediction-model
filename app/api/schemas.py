@@ -353,6 +353,11 @@ class RMProduct(BaseModel):
     title: str
     category: str | None = Field(None, description="Category name (Arabic/English free text)")
     price: float = Field(0.0, ge=0)
+    unitCost: float | None = Field(
+        None, ge=0, description="Cost to produce/procure one unit (EGP). Drives the "
+                                  "profit-optimal production quantity and the surplus "
+                                  "discount floor -- omit if genuinely unknown."
+    )
     freshnessWindow: float | None = Field(
         None, description="Shelf life in days (RestoMind Product.freshnessWindow)"
     )
@@ -486,6 +491,17 @@ class RMSalesRow(BaseModel):
     date: dt.date
     productId: str
     salesQty: int = Field(..., ge=0)
+    productionQty: int | None = Field(
+        None, ge=0, description="Units produced/available that day. Without it the "
+                                  "model can't tell low sales from low demand vs. "
+                                  "low sales because little was made."
+    )
+    closingStock: int | None = Field(
+        None, ge=0, description="Unsold units at close (leftover). 0 means the shelf "
+                                  "sold out -- that day's salesQty is a floor on real "
+                                  "demand, not the true figure, so it is excluded from "
+                                  "the learned level rather than averaged in as-is."
+    )
 
 
 class RMIngestRequest(BaseModel):

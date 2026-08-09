@@ -13,6 +13,29 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def spoilage_severity_for_shelf_life(shelf_life_days: float | None) -> float:
+    """Fraction of a leftover unit's cost that is actually lost, from shelf life alone.
+
+    Single source of truth for this tier table -- `Item.spoilage_severity` (below, for
+    the built-in catalogue) and the RestoMind bridge's `_spoilage_severity`
+    (`app/integration/restomind.py`, for a real restaurant's `freshnessWindow`) both
+    call this instead of keeping their own copy of the same four numbers.
+
+    A same-day item (baladi bread) left on the shelf is a total write-off. Petit four
+    keeps two weeks and kahk a month, so an unsold unit is mostly just stock that sells
+    tomorrow. Charging both at full COGS would badly over-penalise the long-life items
+    and push their production below what is profitable.
+    """
+    d = shelf_life_days if shelf_life_days is not None else 1
+    if d <= 1:
+        return 1.0
+    if d <= 3:
+        return 0.5
+    if d <= 7:
+        return 0.25
+    return 0.15
+
+
 @dataclass(frozen=True)
 class Item:
     """One bakery SKU.
@@ -57,20 +80,9 @@ class Item:
 
     @property
     def spoilage_severity(self) -> float:
-        """Fraction of a leftover unit's cost that is actually lost.
-
-        A same-day item (baladi bread) left on the shelf is a total write-off. Petit
-        four keeps two weeks and kahk a month, so an unsold unit is mostly just stock
-        that sells tomorrow. Charging both at full COGS would badly over-penalise the
-        long-life items and push their production below what is profitable.
-        """
-        if self.shelf_life_days <= 1:
-            return 1.0
-        if self.shelf_life_days <= 3:
-            return 0.5
-        if self.shelf_life_days <= 7:
-            return 0.25
-        return 0.15
+        """Fraction of a leftover unit's cost that is actually lost. See module-level
+        `spoilage_severity_for_shelf_life` -- the tier table lives there now."""
+        return spoilage_severity_for_shelf_life(self.shelf_life_days)
 
     @property
     def shortage_cost(self) -> float:

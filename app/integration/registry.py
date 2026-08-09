@@ -66,7 +66,7 @@ class ProductState:
 # there is a real rename and must win. `price` defaults to 0.0 rather than None, so
 # treat 0 as "not provided" too -- a product that is actually free is not a case the
 # newsvendor economics can price anyway.
-_MERGEABLE_FIELDS = ("category", "freshness_window", "avg_daily_sales", "sku")
+_MERGEABLE_FIELDS = ("category", "freshness_window", "avg_daily_sales", "sku","unit_cost")
 
 
 def _merge_product(existing: ProductInput, incoming: ProductInput) -> ProductInput:
@@ -111,12 +111,19 @@ class RestaurantState:
     def ingest(self, records: pd.DataFrame) -> None:
         """Append sales rows and re-learn each product's ordinary-day level.
 
-        `records` columns: date, productId, salesQty. The learned level is the mean of
-        recent NON-EVENT days, so the calendar multiplier re-adds Ramadan/Eid on top at
-        predict time rather than being baked into the level.
+        `records` columns: date, productId, salesQty, and optionally productionQty /
+        closingStock. The learned level is the mean of recent NON-EVENT, NON-STOCKOUT
+        days, so the calendar multiplier re-adds Ramadan/Eid on top at predict time
+        rather than being baked into the level.
         """
         records = records.copy()
         records["date"] = pd.to_datetime(records["date"])
+        # Optional columns: a caller that only ever sends salesQty (the old minimal
+        # shape) must keep working exactly as before -- missing columns become NaN,
+        # which `is_stockout` below treats as "unknown, assume not stocked out".
+        for col in ("productionQty", "closingStock"):
+            if col not in records.columns:
+                records[col] = pd.NA
         self.history = records if self.history is None else pd.concat(
             [self.history, records], ignore_index=True
         ).drop_duplicates(subset=["date", "productId"], keep="last")
@@ -125,6 +132,11 @@ class RestaurantState:
         cal["date"] = pd.to_datetime(cal["date"])
         flags = ["date", "is_ramadan", "is_public_holiday", "is_kahk_window", "is_weekend"]
         merged = self.history.merge(cal[flags], on="date", how="left")
+        # A day the shelf sold out is supply-constrained: salesQty that day is a floor
+        # on true demand, not the figure itself, so averaging it in like an ordinary
+        # day would drag the learned level down. `closingStock` unknown (most callers,
+        # today) defaults to "not a stockout" -- the pre-existing behaviour.
+        merged["is_stockout"] = merged["closingStock"].fillna(1) == 0
 
         for pid, grp in merged.groupby("productId"):
             st = self.products.get(pid)
@@ -134,6 +146,7 @@ class RestaurantState:
             quiet = grp[
                 (grp["is_ramadan"] == 0) & (grp["is_public_holiday"] == 0)
                 & (grp["is_kahk_window"] == 0) & (grp["is_weekend"] == 0)
+                & (~grp["is_stockout"])
             ].sort_values("date").tail(QUIET_WINDOW)
             if len(quiet) >= MIN_DAYS_FOR_LEARNED:
                 st.learned_level = float(quiet["salesQty"].mean())
@@ -172,6 +185,7 @@ class RestaurantState:
                         "title": st.product.title,
                         "category": st.product.category,
                         "price": st.product.price,
+                        "unit_cost": st.product.unit_cost,
                         "freshness_window": st.product.freshness_window,
                         "avg_daily_sales": st.product.avg_daily_sales,
                         "sku": st.product.sku,
@@ -184,14 +198,7 @@ class RestaurantState:
             "history": (
                 []
                 if self.history is None
-                else [
-                    {
-                        "date": str(r["date"])[:10],
-                        "productId": r["productId"],
-                        "salesQty": int(r["salesQty"]),
-                    }
-                    for r in self.history.to_dict("records")
-                ]
+                else [_history_row_to_dict(r) for r in self.history.to_dict("records")]
             ),
         }
 
@@ -210,6 +217,27 @@ class RestaurantState:
             hist["date"] = pd.to_datetime(hist["date"])
             state.history = hist
         return state
+
+
+def _history_row_to_dict(r: dict) -> dict:
+    """One stored history row -- productionQty/closingStock only when actually known.
+
+    `r` comes from `DataFrame.to_dict("records")`, so a column every row in this
+    restaurant's history lacks a real value for reads back as NaN, not absent. Only
+    write the key when there is a real value: an explicit `null` in the persisted doc
+    would be indistinguishable from "the caller sent 0", which is a real, different
+    answer (a genuinely sold-out day).
+    """
+    row = {
+        "date": str(r["date"])[:10],
+        "productId": r["productId"],
+        "salesQty": int(r["salesQty"]),
+    }
+    for key in ("productionQty", "closingStock"):
+        value = r.get(key)
+        if pd.notna(value):
+            row[key] = int(value)
+    return row
 
 
 class JsonFileRegistryStore:
