@@ -38,7 +38,7 @@
 ```bash
 cd model
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-REGISTRY_STORE=data/registry_state.pkl .venv/bin/uvicorn app.api.main:app --port 8200
+REGISTRY_STORE=data/registry.json .venv/bin/uvicorn app.api.main:app --port 8200
 ```
 الموديل دلوقتي على `http://127.0.0.1:8200`. حطّوا العنوان ده في env بتاع الباك:
 ```
@@ -232,7 +232,7 @@ mongod --dbpath <مجلد-داتا> --port 27017
 #    DB_URL=mongodb://127.0.0.1:27017/restomind
 
 # 3) شغّلوا الموديل
-cd model && REGISTRY_STORE=data/registry_state.pkl \
+cd model && REGISTRY_STORE=data/registry.json \
   .venv/bin/uvicorn app.api.main:app --port 8200 &
 
 # 4) ⭐ seed المخبز الكامل في نفس الـ Mongo

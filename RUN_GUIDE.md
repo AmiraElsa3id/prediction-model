@@ -55,7 +55,7 @@ python3 -m venv .venv
 - لتغيير البورت: `--port 8200`.
 - متغيّرات بيئة اختيارية:
   - `COLD_START=true` → يبدأ بدون أي بيانات (كله rule-based) — لعرض سيناريو مخبز جديد.
-  - `REGISTRY_STORE=data/registry_state.pkl` → يحفظ ما تعلّمه لكل مطعم بعد الريستارت.
+  - `REGISTRY_STORE=data/registry.json` → يحفظ ما تعلّمه لكل مطعم بعد الريستارت.
 
 ### ب) توليد الداتا المحاكاة من جديد
 
