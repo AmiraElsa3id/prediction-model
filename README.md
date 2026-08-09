@@ -37,6 +37,12 @@ existing e-commerce/POS system.
   ≈ **39,000 EGP/month** for one branch. Waste rate **21% → 8%**, while fill rate stays at
   **~92%** of demand served.
 
+The EGP figure is not a constant in the code — it is the printed output of one
+`python -m scripts.run_simulation` run against the generated dataset (best policy vs the
+simulated manager's own production, over 6 rolling-origin folds × 28 test days, scaled to
+30 days). Regenerating the data or changing the folds moves it. Reproduce with
+`python -m app.core.generate && python -m scripts.run_simulation`.
+
 ## The two ideas that carry the project
 
 1. **Forecast a profit-optimal quantile, not the mean.** Over-producing wastes full cost;
@@ -54,9 +60,10 @@ existing e-commerce/POS system.
 
 A brand-new bakery has no history, so the system does **not** wait for data to be useful:
 
-- **Rule-based (day 0+):** each item forecasts from owner priors + hand-encoded Egyptian
-  calendar rules. It already knows croissants fall in Ramadan and kahk only sells before
-  Eid — no training required.
+- **Rule-based (day 0+):** each item forecasts from owner priors + Egyptian calendar rules
+  resolved from `data/market_priors.json` (item override → category → item catalogue). It
+  already knows croissants fall in Ramadan and kahk only sells before Eid — no training
+  required.
 - **Trained model (per item, at 90 days):** the backend posts each night's actuals to
   `POST /data/ingest`. Once an item reaches **90 days** of history it switches automatically
   to the trained `CalendarDecomposed` model. `GET /model/status` shows each item's mode and
@@ -82,19 +89,27 @@ app/
     evaluation.py       WAPE/MASE/pinball + rolling-origin backtest
   models/
     seasonality.py      per-item calendar multipliers (ridge, log space)
-    forecaster.py       SeasonalNaive, LightGBMQuantile, CalendarDecomposed (production)
-    rule_based.py       cold-start forecaster: owner priors + calendar rules, no training
+    forecaster.py       SeasonalNaive, MovingAverage, LightGBMQuantile,
+                        CalendarDecomposed (production)
+    rule_based.py       cold-start forecaster: market priors + calendar rules, no training
     service.py          hybrid routing, ingestion, intervals, explanations — model layer
   marketing/
     copy.py             Egyptian-Arabic copy (LLM + template fallback, validated)
     publisher.py        Meta Graph API client (dry-run by default)
+  integration/
+    restomind.py        stateless bridge to the RestoMind backend's own field shapes
+    registry.py         multi-tenant per-restaurant state; learns each product's level
+    mongo_store.py      durable MongoDB persistence for the registry
+    connect_restomind.py live loop: read their Mongo → call the model → write predictions
+    seed_restomind.py, seed_bakery_history.py   demo/local seeding
   api/
     schemas.py, main.py FastAPI service, Pydantic I/O, Swagger
 scripts/
     run_backtest.py     model comparison
     run_simulation.py   the EGP-saved business simulation
 dashboard.py            Streamlit investor demo
-tests/                  67 tests: calendar dates, effect recovery, API, cold-start, guards
+tests/                  119 tests: calendar dates, effect recovery, API, cold-start,
+                        integration bridge/registry/store, guards
 postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into Postman)
 ```
 
@@ -104,7 +119,7 @@ postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into 
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python -m app.core.generate      # regenerate the synthetic dataset
-.venv/bin/python -m pytest tests/ -q       # 57 tests
+.venv/bin/python -m pytest tests/ -q       # 119 tests
 .venv/bin/python -m scripts.run_backtest   # model comparison table
 .venv/bin/python -m scripts.run_simulation # the money slide
 

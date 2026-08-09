@@ -8,9 +8,12 @@ things that exist before any data does:
 
   1. A per-item baseline the owner gives at onboarding (typical units/day), refined by
      whatever few days of real sales have trickled in.
-  2. Hand-encoded Egyptian calendar rules -- "croissants roughly halve in Ramadan",
-     "kahk only sells in the ten days before Eid al-Fitr" -- taken from the item
-     catalogue's prior multipliers.
+  2. Egyptian calendar rules -- "croissants roughly halve in Ramadan", "kahk only sells
+     in the ten days before Eid al-Fitr" -- resolved by `market_priors.load_priors`,
+     which layers item overrides over category priors over the item catalogue's own
+     multipliers. Those priors come from `data/market_priors.json` (LLM- or
+     market-analysis-sourced); the catalogue is the fallback layer that guarantees every
+     SKU is covered.
 
 It is deliberately NOT a model: no fitting, no lags, no risk of overfitting two data
 points. It is the honest answer to "what should I bake before I know anything", and it

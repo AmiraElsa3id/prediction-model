@@ -1,10 +1,13 @@
 """Demand forecasting models.
 
-Three models sharing one interface so the backtest can compare them fairly:
+Four models sharing one interface so the backtest can compare them fairly:
 
-  SeasonalNaive   the floor every other model must clear
-  MovingAverage   what the bakery manager already does, in effect
-  LightGBMQuantile the production candidate
+  SeasonalNaive      the floor every other model must clear
+  MovingAverage      what the bakery manager already does, in effect
+  LightGBMQuantile   one quantile booster per distinct newsvendor q*, all SKUs pooled
+  CalendarDecomposed the production model -- level x calendar multiplier; see its own
+                     docstring for why one booster over lags and calendar together does
+                     not work
 
 The naive baseline is not a formality. On short, noisy, per-item series it frequently
 beats a tuned gradient booster, and shipping a model that loses to "same day last week"

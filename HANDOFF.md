@@ -154,6 +154,10 @@ Decisions, each learned the hard way — do not "simplify" them away:
 - Business sim: waste **21%→8%**, **~39,000 EGP/month/branch**, fill rate **~92%**.
 - Newsvendor quantile beats plain median by ~108k EGP over the test window.
 
+The EGP numbers are printed output from one `python -m scripts.run_simulation` run on the
+generated dataset, not constants in the code and not asserted by any test. Regenerating the
+data moves them; re-run the script before quoting them.
+
 ---
 
 ## 5. Cold-start → trained hybrid (the "rule-based then train" flow the owner asked for)
