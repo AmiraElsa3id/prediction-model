@@ -40,11 +40,13 @@ if TYPE_CHECKING:
     from app.integration.mongo_store import RegistryStore
 
 # Real days a product needs before its learned level is trusted over the owner estimate.
-MIN_DAYS_FOR_LEARNED = 14
+MIN_DAYS_FOR_LEARNED = 90
 # Days beyond which we call the level well-established (higher confidence).
 CONFIDENT_DAYS = 90
 # Window of recent quiet (non-event) days used to estimate the ordinary level.
-QUIET_WINDOW = 42
+# Must not drop below MIN_DAYS_FOR_LEARNED: `.tail(QUIET_WINDOW)` caps the sample in
+# ingest, so a smaller window would make the >= MIN_DAYS_FOR_LEARNED check impossible.
+QUIET_WINDOW = 90
 
 
 @dataclass
@@ -130,6 +132,11 @@ class RestaurantState:
             ].sort_values("date").tail(QUIET_WINDOW)
             if len(quiet) >= MIN_DAYS_FOR_LEARNED:
                 st.learned_level = float(quiet["salesQty"].mean())
+            elif st.learned_level is not None:
+                # Re-ingest re-evaluates every product: a level learned under an
+                # older, lower threshold drops back to the estimate until the
+                # product earns the new threshold again.
+                st.learned_level = None
 
     def level_for(self, pid: str) -> tuple[float | None, str, str]:
         """`(level, mode, confidence)` for one product.

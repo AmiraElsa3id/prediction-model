@@ -6,6 +6,12 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.api.main import app
+from app.integration.registry import MIN_DAYS_FOR_LEARNED
+
+# ~55% of calendar days are "quiet" (weekends are excluded, plus Ramadan and the
+# public holidays add ~6 weeks a year), so 2.2x the threshold always leaves a
+# surplus of quiet days for a product meant to be learned.
+_SEED_DAYS = int(MIN_DAYS_FOR_LEARNED * 2.2)
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +38,7 @@ def test_seeding_sales_changes_the_prediction(client):
     assert before["featuresUsed"]["levelSource"] == "owner_estimate"
 
     client.post("/integration/restomind/ingest", json={
-        "restaurantId": rid, "records": _sales(pid, 30, 110),
+        "restaurantId": rid, "records": _sales(pid, _SEED_DAYS, 110),
         "products": [{"productId": pid, "title": "كرواسون", "category": "معجنات"}],
     })
 
@@ -48,7 +54,7 @@ def test_registry_is_per_tenant(client):
             "avgDailySales": 40, "targetWeek": "2025-02-10"}
 
     client.post("/integration/restomind/ingest", json={
-        "restaurantId": "REG_A", "records": _sales(pid, 30, 200),
+        "restaurantId": "REG_A", "records": _sales(pid, _SEED_DAYS, 200),
         "products": [{"productId": pid, "title": "كنافة", "category": "حلويات شرقية"}],
     })
     a = client.post("/integration/restomind/predict", json={"restaurantId": "REG_A", **prod}).json()
@@ -74,7 +80,7 @@ def test_too_little_data_keeps_owner_estimate(client):
 def test_registry_status_reports_learned_products(client):
     rid, pid = "REG_R4", "REG_P4"
     client.post("/integration/restomind/ingest", json={
-        "restaurantId": rid, "records": _sales(pid, 30, 90),
+        "restaurantId": rid, "records": _sales(pid, _SEED_DAYS, 90),
         "products": [{"productId": pid, "title": "فطير", "category": "مالح"}],
     })
     st = client.get(f"/integration/restomind/status/{rid}").json()
@@ -85,7 +91,7 @@ def test_registry_status_reports_learned_products(client):
 def test_status_reports_its_own_thresholds(client):
     """RestoMind draws a per-product progress bar from these.
 
-    It used to hardcode `MIN_DAYS_FOR_LEARNED = 14` on its own side, so tuning the
+    It used to hardcode `MIN_DAYS_FOR_LEARNED = 90` on its own side, so tuning the
     threshold here silently made that bar wrong. The numbers belong to this module,
     so the endpoint states them rather than leaving the caller to guess.
     """
@@ -120,8 +126,9 @@ def test_registry_survives_a_restart(tmp_path):
     store = tmp_path / "registry.json"
     rows = pd.DataFrame([
         {"date": d, "productId": "p1", "salesQty": 100}
-        # 30 consecutive days guarantees >= 14 quiet weekdays.
-        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+        # _SEED_DAYS consecutive days guarantees the >= MIN_DAYS_FOR_LEARNED quiet
+        # weekdays, so the learned level is set.
+        for d in pd.date_range("2025-01-06", periods=_SEED_DAYS).strftime("%Y-%m-%d")
     ])
 
     first = RestaurantRegistry(persist_path=store)
@@ -268,7 +275,7 @@ def test_production_plan_uses_ingested_sales(client):
     # Real sales run far below the owner's 200/day guess.
     client.post("/integration/restomind/ingest", json={
         "restaurantId": rid,
-        "records": _sales(pid, 40, 60),
+        "records": _sales(pid, _SEED_DAYS, 60),
         "products": [product],
     })
 
@@ -286,7 +293,7 @@ def test_production_plan_is_per_tenant(client):
 
     client.post("/integration/restomind/ingest", json={
         "restaurantId": "ISO_A",
-        "records": _sales("ISO_P", 40, 20),
+        "records": _sales("ISO_P", _SEED_DAYS, 20),
         "products": [product],
     })
 
@@ -318,7 +325,7 @@ def test_surplus_offers_uses_ingested_sales(client):
 
     client.post("/integration/restomind/ingest", json={
         "restaurantId": rid,
-        "records": _sales(pid, 40, 15),
+        "records": _sales(pid, _SEED_DAYS, 15),
         "products": [{k: v for k, v in stock_item.items() if k != "currentStock"}],
     })
 

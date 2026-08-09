@@ -12,6 +12,12 @@ import uuid
 import pandas as pd
 import pytest
 
+from app.integration.registry import MIN_DAYS_FOR_LEARNED
+
+# Same sizing as test_registry.py: 2.2x the threshold guarantees a surplus of quiet
+# (non-weekend, non-event) days so the learned level is actually reached.
+_SEED_DAYS = int(MIN_DAYS_FOR_LEARNED * 2.2)
+
 pymongo = pytest.importorskip("pymongo")
 
 MONGO_URL = "mongodb://127.0.0.1:27017"
@@ -51,7 +57,7 @@ def test_round_trips_through_a_real_mongo_document(db_name):
 
     rows = pd.DataFrame([
         {"date": d, "productId": "p1", "salesQty": 80}
-        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+        for d in pd.date_range("2025-01-06", periods=_SEED_DAYS).strftime("%Y-%m-%d")
     ])
     reg.ingest("R1", rows, [ProductInput(product_id="p1", title="Bread", category="bread")])
 
@@ -68,7 +74,7 @@ def test_survives_a_process_restart_via_mongo(db_name):
 
     rows = pd.DataFrame([
         {"date": d, "productId": "p1", "salesQty": 55}
-        for d in pd.date_range("2025-01-06", periods=30).strftime("%Y-%m-%d")
+        for d in pd.date_range("2025-01-06", periods=_SEED_DAYS).strftime("%Y-%m-%d")
     ])
 
     first_store = MongoRegistryStore(MONGO_URL, db_name)
