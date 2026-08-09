@@ -1,14 +1,16 @@
-"""RestoMind integration bridge: accepts their product shapes, returns model output.
+"""RestoMind integration bridge: accepts their product shapes, returns basis-level output.
 
-Cold-start (rule-based) since no sales history exists yet -- the day-one path for the
-Admin/Stores screens while the backend is still being built.
+The rule-based calendar layer is gone (see HANDOFF.md §8). The bridge forecasts from a
+basis daily level -- a learned level from this restaurant's real sales, else the owner's
+estimate -- and answers a product with no basis at all with a "still training" message
+rather than a guessed number.
 """
 
 from fastapi.testclient import TestClient
 import pytest
 
 from app.api.main import app
-from app.integration.restomind import map_category, to_business_time
+from app.integration.restomind import to_business_time
 
 import datetime as dt
 import os
@@ -29,13 +31,6 @@ PRODUCTS = [
 ]
 
 
-def test_category_mapping_handles_arabic_and_unknown():
-    assert map_category("معجنات") == "pastry"
-    assert map_category("حلويات شرقية") == "sweet"
-    assert map_category("مخبوزات") == "bread"
-    assert map_category("Something Random") == ""   # neutral fallback
-
-
 def test_production_plan_returns_one_row_per_product(client):
     r = client.post("/integration/restomind/production-plan",
                     json={"restaurantId": "R1", "date": "2025-02-11", "products": PRODUCTS})
@@ -43,19 +38,33 @@ def test_production_plan_returns_one_row_per_product(client):
     b = r.json()
     assert len(b["items"]) == len(PRODUCTS)
     assert b["totalRecommendedQty"] == sum(i["recommendedQty"] for i in b["items"])
-    assert all(i["source"] == "rule_based" for i in b["items"])
+    # With no ingested sales the plan is the owner's estimate.
+    assert all(i["levelSource"] == "owner_estimate" for i in b["items"])
+    assert all(i["trainingMessage"] is None for i in b["items"])
 
 
-def test_production_plan_applies_ramadan_by_category(client):
-    """Croissant (pastry) must be lower in Ramadan than on a normal day, from priors."""
+def test_production_plan_is_basis_level_not_a_calendar_guess(client):
+    """Post-rule, the plan is the basis level: no category multiplier, date-independent."""
     normal = client.post("/integration/restomind/production-plan",
                          json={"restaurantId": "R1", "date": "2025-02-11", "products": PRODUCTS}).json()
     ramadan = client.post("/integration/restomind/production-plan",
                          json={"restaurantId": "R1", "date": "2025-03-15", "products": PRODUCTS}).json()
-    n = {i["title"]: i["recommendedQty"] for i in normal["items"]}
-    rm = {i["title"]: i["recommendedQty"] for i in ramadan["items"]}
-    assert rm["كرواسون"] < n["كرواسون"]     # breakfast pastry falls
-    assert rm["كنافة"] > n["كنافة"]          # Ramadan sweet rises
+    n = {i["productId"]: i["recommendedQty"] for i in normal["items"]}
+    rm = {i["productId"]: i["recommendedQty"] for i in ramadan["items"]}
+    assert n == rm, "the removed rule layer must not move the plan by calendar anymore"
+
+
+def test_production_plan_with_no_basis_returns_training_message(client):
+    """No owner estimate, no learned level -> 'still training', not a guess."""
+    r = client.post("/integration/restomind/production-plan",
+                    json={"restaurantId": "R1", "date": "2025-02-11",
+                          "products": [{"productId": "p_new", "title": "صنف جديد",
+                                        "price": 30, "freshnessWindow": 2}]})
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["recommendedQty"] == 0
+    assert item["trainingMessage"]
+    assert item["source"] == "training"
 
 
 def test_surplus_offers_flags_risk_and_writes_arabic_copy(client):
@@ -69,8 +78,6 @@ def test_surplus_offers_flags_risk_and_writes_arabic_copy(client):
     for it in items:
         assert 5 <= it["suggestedDiscountPct"] <= 70
         assert it["offerCopyAr"] and it["title"] in it["offerCopyAr"]
-        # low-price item must not collapse to "2 بدل 2"
-        assert it["newPrice"] < it.get("price", 9e9) if "price" in it else True
 
 
 def test_surplus_quiet_in_the_morning(client):
@@ -84,11 +91,8 @@ def test_surplus_quiet_in_the_morning(client):
 def test_surplus_offers_respects_a_zero_avg_daily_sales(client):
     """avgDailySales=0 means "sells nothing" on the surplus path too.
 
-    `surplus_offers` used a truthy `s.avg_daily_sales or DEFAULT_DAILY_LEVEL`,
-    so a dead-slow SKU honestly reporting 0/day was credited with 40/day of
-    expected sell-through. Its projected surplus collapsed to ~0 and it was
-    skipped -- never flagged, never discounted -- which is precisely the stock
-    most at risk of being thrown away.
+    A dead-slow product honestly reporting 0/day with 15 units on hand must be flagged
+    as pure surplus -- never credited with expected sell-through it will not have.
     """
     dead_slow = {
         "productId": "p_dead", "title": "بسبوسة قديمة", "category": "حلويات شرقية",
@@ -101,18 +105,12 @@ def test_surplus_offers_respects_a_zero_avg_daily_sales(client):
     items = r.json()["itemsAtRisk"]
     assert len(items) == 1, "a 0/day product with 15 units on hand must be flagged"
     assert items[0]["productId"] == "p_dead"
-    # Nothing is expected to sell -> the whole 15 units are surplus -> raw_risk 1.0
-    # -> the top discount tier.
     assert items[0]["projectedSurplus"] == 15
     assert items[0]["suggestedDiscountPct"] == 40
 
 
-def test_surplus_offers_still_substitutes_the_default_for_a_null_estimate(client):
-    """None is "no estimate given" and must keep falling back to the default level.
-
-    Guards the fix above from over-correcting into "treat missing as zero",
-    which would flag every cold-start product as pure surplus.
-    """
+def test_surplus_skips_a_product_without_any_basis(client):
+    """No basis (no learned level, no owner estimate) -> cannot judge risk, so skip."""
     unknown = {
         "productId": "p_new", "title": "صنف جديد", "category": "حلويات شرقية",
         "price": 30, "freshnessWindow": 2, "avgDailySales": None, "currentStock": 15,
@@ -121,8 +119,6 @@ def test_surplus_offers_still_substitutes_the_default_for_a_null_estimate(client
                     json={"restaurantId": "R1", "stock": [unknown],
                           "timestamp": "2025-02-11T14:00:00", "closeHour": 22})
     assert r.status_code == 200
-    # 40/day * remaining share comfortably covers 15 units, so there is no
-    # projected surplus and nothing to discount.
     assert r.json()["itemsAtRisk"] == []
 
 
@@ -136,32 +132,17 @@ def test_to_business_time_converts_an_aware_instant_and_passes_naive_through():
     assert to_business_time(
         dt.datetime(2026, 1, 15, 19, 30, tzinfo=dt.timezone.utc)
     ) == dt.datetime(2026, 1, 15, 21, 30)
-    # Date rollover: 21:30Z in July is already the next Cairo day, and `.date()`
-    # is what keys the holiday/Ramadan calendar features.
+    # Date rollover: 21:30Z in July is already the next Cairo day.
     assert to_business_time(
         dt.datetime(2026, 7, 29, 21, 30, tzinfo=dt.timezone.utc)
     ).date() == dt.date(2026, 7, 30)
-    # A naive timestamp is taken to already be Cairo wall-clock: untouched.
     naive = dt.datetime(2026, 7, 29, 22, 30)
     assert to_business_time(naive) == naive
 
 
 def test_surplus_offers_reads_the_clock_in_cairo_not_utc(client):
-    """An offset-aware UTC timestamp must be converted before `.hour` is read.
-
-    The RestoMind backend sends `new Date().toISOString()` -- Z-suffixed UTC --
-    which Pydantic parses as tz-aware UTC. Reading `.hour` off that compared a
-    UTC hour against `closeHour`, a *Cairo* wall-clock hour. In July (UTC+3),
-    at Cairo 22:30 -- half an hour past closing -- the scan thought it was 19:30
-    with 2.5 hours still to sell, and the sell-through curve still expected 9%
-    more to move. It under-flagged surplus at exactly the moment it runs.
-
-    The existing tests all passed *naive* timestamps, which is why this was
-    invisible; this one is deliberately offset-aware.
-    """
+    """An offset-aware UTC timestamp must be converted before `.hour` is read."""
     url = "/integration/restomind/surplus-offers"
-    # avgDailySales 0.0 -> always flagged, so hoursToClose is always observable
-    # and is the only thing varying between the three posts below.
     dead_slow = {
         "productId": "p_dead", "title": "بسبوسة قديمة", "category": "حلويات شرقية",
         "price": 30, "freshnessWindow": 2, "avgDailySales": 0.0, "currentStock": 15,
@@ -175,16 +156,13 @@ def test_surplus_offers_reads_the_clock_in_cairo_not_utc(client):
         assert len(items) == 1
         return items[0]
 
-    # 19:30Z is 22:30 in Cairo: closing time has already passed.
+    # 19:30Z is 22:30 in Cairo: past closing.
     aware_utc = scan("2026-07-29T19:30:00Z")
-    # The same wall-clock moment, written the way this file's other tests write it.
     naive_cairo = scan("2026-07-29T22:30:00")
-    # What the buggy reading effectively used: 19:30 treated as Cairo local.
     naive_utc_hour = scan("2026-07-29T19:30:00")
 
     assert aware_utc["hoursToClose"] == 0.0, "past closing -- nothing left to sell in"
     assert aware_utc["hoursToClose"] == naive_cairo["hoursToClose"]
-    # The load-bearing half: it must NOT read as 19:30 local.
     assert naive_utc_hour["hoursToClose"] == 2.5
     assert aware_utc["hoursToClose"] != naive_utc_hour["hoursToClose"]
 
@@ -197,15 +175,13 @@ def test_predict_matches_restomind_prediction_shape(client):
     })
     assert r.status_code == 200
     b = r.json()
-    # Fields RestoMind's prediction.model.ts expects.
     for field in ("restaurantId", "productId", "modelVersionId", "targetWeek",
                   "predictedOrders", "featuresUsed"):
         assert field in b
     assert b["predictedOrders"] > 0
     assert len(b["dailyBreakdown"]) == 7
-    # Ramadan week -> the calendar snapshot records it, and it drives the number up.
-    assert b["featuresUsed"]["calendar"]["isRamadan"] is True
-    assert any(f["factor"] == "Ramadan" and f["direction"] == "increase" for f in b["factors"])
+    # Post-rule, no invented Ramadan factor: the number is the basis level.
+    assert b["factors"] == []
 
 
 def test_predict_weekly_total_equals_daily_sum(client):
@@ -213,76 +189,50 @@ def test_predict_weekly_total_equals_daily_sum(client):
         "restaurantId": "R1", "productId": "P1", "title": "كرواسون",
         "category": "معجنات", "targetWeek": "2025-02-10", "avgDailySales": 180,
     }).json()
-    assert r["predictedOrders"] == sum(d["qty"] for d in r["dailyBreakdown"])
+    assert r["predictedOrders"] == sum(d["predictedQuantity"] for d in r["dailyBreakdown"])
 
 
 def test_zero_avg_daily_sales_is_respected_not_replaced_by_default():
-    """avgDailySales=0 means 'sells nothing', not 'no estimate given'."""
-    from app.core.egypt_calendar import CALENDAR
-    from app.integration.restomind import DEFAULT_DAILY_LEVEL, ProductInput, _forecast_one
-    import datetime as dt
+    """avgDailySales=0 means "sells nothing", not "give it a made-up level"."""
+    from app.integration.restomind import ProductInput, basis_level
 
-    feats = CALENDAR.features(dt.date(2025, 2, 11))
     zero = ProductInput(product_id="p0", title="Dead SKU", category="bread", avg_daily_sales=0.0)
-    qty, _ = _forecast_one(zero, feats)
-    assert qty == 0.0
+    assert basis_level(zero) == 0.0
 
-    # None means "no estimate given" -> the default level is substituted, so it
-    # must forecast identically to a product that explicitly states that level.
     unknown = ProductInput(product_id="p1", title="New SKU", category="bread", avg_daily_sales=None)
-    explicit_default = ProductInput(
-        product_id="p1b", title="New SKU", category="bread",
-        avg_daily_sales=DEFAULT_DAILY_LEVEL,
-    )
-    qty_unknown, _ = _forecast_one(unknown, feats)
-    qty_explicit, _ = _forecast_one(explicit_default, feats)
-    assert qty_unknown > 0
-    assert qty_unknown == qty_explicit
+    assert basis_level(unknown) is None   # no basis -> still training
 
 
-def test_fractional_avg_daily_sales_is_preserved():
-    from app.core.egypt_calendar import CALENDAR
-    from app.integration.restomind import ProductInput, _forecast_one
-    import datetime as dt
-
-    feats = CALENDAR.features(dt.date(2025, 2, 11))
-    low = ProductInput(product_id="p2", title="Slow SKU", category="bread", avg_daily_sales=0.43)
-    qty, _ = _forecast_one(low, feats)
-    assert 0 < qty < 5
-
-
-def test_predict_daily_breakdown_uses_predicted_quantity_key(client):
-    r = client.post("/integration/restomind/predict",
-                    json={"restaurantId": "R1", "productId": "p1", "title": "كرواسون",
-                          "category": "معجنات", "targetWeek": "2025-03-09",
-                          "avgDailySales": 180})
+def test_predict_without_basis_reports_training(client):
+    r = client.post("/integration/restomind/predict", json={
+        "restaurantId": "R1", "productId": "p0", "title": "Dead SKU",
+        "category": "bread", "targetWeek": "2025-02-10",
+    })
     assert r.status_code == 200
     b = r.json()
-    assert len(b["dailyBreakdown"]) == 7
-    for day in b["dailyBreakdown"]:
-        assert "predictedQuantity" in day, "consumer reads predictedQuantity"
-        assert day["predictedQuantity"] == day["qty"], "qty kept as deprecated alias"
-    # The weekly total must reconcile with the daily rows.
-    assert b["predictedOrders"] == sum(d["predictedQuantity"] for d in b["dailyBreakdown"])
+    assert b["predictedOrders"] == 0
+    assert b["trainingMessage"]
+    assert b["featuresUsed"]["levelSource"] == "none"
 
 
-def test_predict_daily_breakdown_is_not_flat_across_ramadan(client):
-    """A week spanning Ramadan must vary day to day, not be a flat average."""
+def test_predict_daily_breakdown_repeats_the_basis_level(client):
+    """Post-rule the week is the daily basis level; day count reconciles with total."""
     r = client.post("/integration/restomind/predict",
-                    json={"restaurantId": "R1", "productId": "p1", "title": "كرواسون",
-                          "category": "معجنات", "targetWeek": "2025-02-27",
-                          "avgDailySales": 180})
-    qtys = [d["predictedQuantity"] for d in r.json()["dailyBreakdown"]]
-    assert len(set(qtys)) > 1, "calendar signal must survive into the daily rows"
+                    json={"restaurantId": "R1", "productId": "pflat", "title": "توست",
+                          "category": "bread", "targetWeek": "2025-03-09",
+                          "avgDailySales": 100})
+    b = r.json()
+    assert len(b["dailyBreakdown"]) == 7
+    assert {d["predictedQuantity"] for d in b["dailyBreakdown"]} == {100}
+    assert b["predictedOrders"] == 700
+    assert b["featuresUsed"]["baseDailyLevel"] == 100
 
 
-def test_predict_week_zero_avg_daily_sales_reports_true_base_level(client):
-    """avgDailySales=0 means 'sells nothing' -- featuresUsed.baseDailyLevel must reflect
-    that, not silently fall back to DEFAULT_DAILY_LEVEL (40)."""
+def test_predict_zero_avg_daily_sales_reports_true_base_level(client):
+    """avgDailySales=0 is a real level, not a silently substituted default."""
     r = client.post("/integration/restomind/predict", json={
         "restaurantId": "R1", "productId": "p0", "title": "Dead SKU",
         "category": "bread", "targetWeek": "2025-02-10", "avgDailySales": 0,
     })
     assert r.status_code == 200
-    b = r.json()
-    assert b["featuresUsed"]["baseDailyLevel"] == 0
+    assert r.json()["featuresUsed"]["baseDailyLevel"] == 0

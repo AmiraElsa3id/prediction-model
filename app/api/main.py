@@ -27,7 +27,7 @@ from app.integration import restomind
 from app.integration.registry import RestaurantRegistry
 from app.marketing.copy import OfferService
 from app.marketing.publisher import MetaPublisher
-from app.models.service import ForecastService
+from app.models.service import ForecastService, ModelNotReadyError
 
 STATE: dict = {}
 
@@ -39,8 +39,9 @@ async def lifespan(app: FastAPI):
     Two start modes, chosen by the COLD_START env var:
       * default        -- load the full (simulated) history and train, as before. Every
                           item is already past the threshold, so all use the model.
-      * COLD_START=true -- start with zero history. Every item is rule-based until data
-                          is posted to /data/ingest. This is the cold-start demo path.
+      * COLD_START=true -- start with zero history. Every item is untrained until data
+                          is posted to /data/ingest. This is the cold-start demo path:
+                          until an item reaches the threshold there is NO forecast.
     """
     service = ForecastService(horizon=1)
     if os.getenv("COLD_START", "false").lower() == "true":
@@ -143,6 +144,26 @@ async def _key_error_handler(request, exc: KeyError) -> JSONResponse:
     )
 
 
+@app.exception_handler(ModelNotReadyError)
+async def _model_not_ready_handler(request, exc: ModelNotReadyError) -> JSONResponse:
+    """A forecast was asked for an item the model is not ready to serve yet.
+
+    The rule-based cold-start layer was removed (HANDOFF.md §8): below the training
+    threshold an item has NO forecast, not a fallback number. The API answers 409 —
+    "still training" — and the caller keeps its own estimator until the item's model
+    exists, rather than having a number minted for it.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=schemas.ErrorResponse(
+            error="model_not_ready",
+            detail=str(exc),
+            hint="Continue using your existing ordering until this item reaches the "
+                 "training threshold and its own model trains.",
+        ).model_dump(),
+    )
+
+
 # -- health --------------------------------------------------------------------------
 
 
@@ -162,10 +183,11 @@ def health() -> dict:
 
 @app.get("/model/status", response_model=schemas.ModelStatusResponse, tags=["lifecycle"])
 def model_status() -> schemas.ModelStatusResponse:
-    """Per-item mode: which items are still rule-based, which use the trained model.
+    """Per-item mode: which items are untrained, which use the trained model.
 
-    A new bakery starts fully rule-based; as history accumulates each item promotes to
-    the trained model at the threshold. The frontend can show a progress bar per item
+    A new bakery starts fully untrained; as history accumulates each item promotes to
+    the trained model at the threshold. Until then there is NO forecast for it (the
+    rule-based layer was removed) -- the frontend can show a progress bar per item
     from `progress` / `days_until_switch`.
     """
     return schemas.ModelStatusResponse(**_service().status())
@@ -175,9 +197,9 @@ def model_status() -> schemas.ModelStatusResponse:
 def ingest(req: schemas.IngestRequest) -> schemas.IngestResponse:
     """Post end-of-day actuals so history accumulates and items promote to the model.
 
-    This is the endpoint the POS/e-commerce backend calls each night. It updates the
-    rule-based baselines immediately and retrains the model whenever an item reaches the
-    training threshold (default 90 days).
+    This is the endpoint the POS/e-commerce backend calls each night. It retrains the
+    model whenever an item reaches the training threshold (default 90 days). Below the
+    threshold an item has no forecast at all.
     """
     records = pd.DataFrame([r.model_dump() for r in req.records])
     # leftover_qty is what the pipeline expects; derive it from closing_stock.
@@ -399,8 +421,8 @@ def _window(w) -> tuple[dt.date, dt.date] | None:
 
 # -- RestoMind integration bridge ----------------------------------------------------
 # Speaks the RestoMind backend's shapes so its Admin/Stores screens can consume model
-# output today, cold-start (rule-based), before sales history exists. See
-# app/integration/restomind.py.
+# output today (owner estimate or a learned level) before the trained pipeline exists.
+# See app/integration/restomind.py.
 
 
 @app.post(
@@ -411,8 +433,10 @@ def _window(w) -> tuple[dt.date, dt.date] | None:
 def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProductionPlanResponse:
     """Admin screen: how much of each product to make on a date, per restaurant.
 
-    Accepts RestoMind products directly. Runs rule-based (calendar priors by category +
-    owner's `avgDailySales`) since there is no sales history yet, so it works on day one.
+    Accepts RestoMind products directly. Forecast is the product's basis level --
+    learned from this restaurant's real ingested sales when available, else the owner's
+    `avgDailySales`. A product with neither is marked `training` in the response
+    instead of being given a guessed quantity.
     """
     products = [
         restomind.ProductInput(
@@ -502,8 +526,9 @@ def rm_predict(req: schemas.RMPredictRequest) -> schemas.RMPredictResponse:
 
     This is what their Phase-5 AI pipeline calls: it returns `predictedOrders` for a
     `targetWeek` plus a `featuresUsed` snapshot, mapping straight onto their prediction
-    document. Rule-based today (cold start); the same contract will serve trained-model
-    output once real sales flow in -- so it is safe to wire now and won't change later.
+    document. The number is the product's basis level (learned from that restaurant's
+    real sales if present, else the owner's estimate). A product with no basis gets
+    `predictedOrders: 0` with a `trainingMessage` -- still training, not a guess.
     """
     product = restomind.ProductInput(
         product_id=req.productId, title=req.title, category=req.category,

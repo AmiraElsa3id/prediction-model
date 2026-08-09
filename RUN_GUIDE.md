@@ -54,7 +54,7 @@ python3 -m venv .venv
   بـ **Try it out** → **Execute**.
 - لتغيير البورت: `--port 8200`.
 - متغيّرات بيئة اختيارية:
-  - `COLD_START=true` → يبدأ بدون أي بيانات (كله rule-based) — لعرض سيناريو مخبز جديد.
+  - `COLD_START=true` → يبدأ بدون أي بيانات (مفيش توقّع لحد ما يُدرَّب) — لعرض سيناريو مخبز جديد.
   - `REGISTRY_STORE=data/registry_state.pkl` → يحفظ ما تعلّمه لكل مطعم بعد الريستارت.
 
 ### ب) توليد الداتا المحاكاة من جديد
@@ -97,13 +97,11 @@ model/
 │   │   ├── generate.py           ← مولّد الداتا المحاكاة (سنتين مبيعات بتأثيرات معروفة)
 │   │   ├── features.py           ← تنظيف + هندسة features (lags/rolling/calendar) + معالجة نفاد المخزون
 │   │   ├── evaluation.py         ← مقاييس WAPE/MASE/pinball + backtest
-│   │   ├── surplus.py            ← كشف الفائض قرب القفل + مستويات الخصم
-│   │   └── market_priors.py      ← حساسية المناسبات لكل فئة (يولّدها LLM أو الملف)
+│   │   └── surplus.py            ← كشف الفائض قرب القفل + مستويات الخصم
 │   ├── models/                   ← الموديلات
 │   │   ├── seasonality.py        ← تأثيرات التقويم (Ridge) — قلب الميزة المصرية
 │   │   ├── forecaster.py         ← الموديل الإنتاجي CalendarDecomposed + الأساس seasonal-naive
-│   │   ├── rule_based.py         ← موديل البداية (cold-start) بدون داتا
-│   │   └── service.py            ← التوجيه الهجين (قواعد → تدريب بعد 90 يوم) + ingestion
+│   │   └── service.py            ← بوابة حد التدريب (قبل 90 يوم مفيش توقّع) + ingestion
 │   ├── marketing/                ← تسويق الفائض
 │   │   ├── copy.py               ← كتابة الإعلان بالعامية (LLM + قوالب احتياطية)
 │   │   └── publisher.py          ← النشر على فيسبوك/انستجرام (معاينة افتراضيًا)
@@ -119,10 +117,9 @@ model/
 ├── scripts/
 │   ├── run_backtest.py           ← مقارنة الموديلات
 │   └── run_simulation.py         ← محاكاة التوفير بالجنيه
-├── tests/                        ← 83 اختبار
+├── tests/                        ← 107 اختبار
 ├── data/
 │   ├── synthetic_pos.parquet     ← الداتا المولّدة
-│   ├── market_priors.json        ← حساسية المناسبات (نتيجة تحليل الـ LLM)
 │   └── models/                   ← الموديلات المحفوظة
 ├── dashboard.py                  ← عرض Streamlit
 ├── postman_collection.json       ← 17 طلب جاهز (تستوردي في Postman)
@@ -140,7 +137,7 @@ model/
 ## 5. أهم 3 ملفات تفهميها الأول
 
 1. **`app/api/main.py`** — كل الـ endpoints (نقطة الدخول).
-2. **`app/models/service.py`** — الموديل والتوجيه الهجين (قواعد ↔ تدريب).
+2. **`app/models/service.py`** — الموديل مع حد التدريب (مفيش توقّع قبل 90 يوم 🡒 التدريب).
 3. **`app/integration/`** — كل حاجة خاصة بالربط مع RestoMind.
 
 ---
@@ -150,7 +147,7 @@ model/
 | المجموعة | الـ Endpoint | بيعمل إيه |
 |---|---|---|
 | ops | `GET /health` | حالة السيرفر |
-| lifecycle | `GET /model/status` | كل صنف قواعد ولا موديل مدرَّب |
+| lifecycle | `GET /model/status` | كل صنف: مفيش توقّع بعد؟ (untrained) ولا موديل مدرَّب |
 | lifecycle | `POST /data/ingest` | إدخال مبيعات (الموديل بيتعلّم) |
 | forecasting | `POST /forecast/daily` · `/weekly` | توقّع صنف واحد |
 | forecasting | `POST /forecast/daily-batch` · `/weekly-batch` | توقّع كل الأصناف مرة واحدة |

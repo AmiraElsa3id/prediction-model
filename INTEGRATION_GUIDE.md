@@ -73,21 +73,23 @@ Content-Type: application/json
 {
   "restaurantId": "665f...",
   "productId": "665f...",
-  "modelVersionId": "restomind-bridge/rule_based-v0.1",
+  "modelVersionId": "restomind-bridge/basis-v0.1",
   "targetWeek": "2025-03-10",
-  "predictedOrders": 750,
+  "predictedOrders": 280,
   "confidence": "low",
+  "trainingMessage": null,
   "featuresUsed": {
-    "mode": "rule_based",
+    "mode": "training",
     "baseDailyLevel": 40,
     "levelSource": "owner_estimate",
-    "categoryResolved": "sweet",
     "calendar": { "isRamadan": true, "daysToEidFitr": 20 }
   },
-  "factors": [ { "factor": "Ramadan", "impact_pct": 150, "direction": "increase" } ],
-  "dailyBreakdown": [ { "date": "2025-03-10", "qty": 100, "factors": [...] }, ... ]
+  "factors": [],
+  "dailyBreakdown": [ { "date": "2025-03-10", "predictedQuantity": 40, "qty": 40, "factors": [] }, ... ]
 }
 ```
+
+**ملحوظة:** بيجيب الرقم من `baseDailyLevel` (تقدير المالك أو مستوى متعلّم من مبيعات حقيقية بـ `/integration/restomind/ingest`). لو المنتج مفيش له أي أساس (لا مستوى متعلّم ولا `avgDailySales`)، هيرجع `predictedOrders: 0` مع رسالة `trainingMessage` توضح إنه لسه بيتدرّب — مش رقم مخمن من قواعد.
 
 **الباك بياخد الرد ده ويخزّنه** في `predictions` كده (المفاتيح متطابقة تقريبًا):
 `restaurantId, productId, modelVersionId, targetWeek, predictedOrders, featuresUsed, actualOrders:null`.
@@ -252,8 +254,9 @@ MONGO_URL=mongodb://127.0.0.1:27017/restomind MODEL_URL=http://127.0.0.1:8200 \
 
 ### ليه الـ `sku` field مهم؟
 المنتجات اللي عليها `sku` (زي `SWEET_KONAFA`) بيوجّهها الكونيكتور للموديل **المدرَّب**
-(`/forecast/weekly` — دقة عالية، بيعرف رمضان). المنتجات من غير `sku` بتروح للموديل
-البدائي (rule-based). فالـ seed بيخلّي كل المنتجات مربوطة بالموديل المدرَّب.
+(`/forecast/weekly` — دقة عالية، بيعرف رمضان). المنتجات من غير `sku` بتروح للجسر اللي
+بيردّ بتقدير المالك/مستوى متعلّم، أو "still training" لو مفيش أساس. فالـ seed بيخلّي كل
+المنتجات مربوطة بالموديل المدرَّب.
 
 ### التحقق (كلكم لازم تشوفوا نفس الأرقام)
 ```bash
@@ -265,14 +268,18 @@ mongosh --port 27017 restomind --eval 'db.predictions.find({},{targetWeek:1,pred
 
 ## 7. الفرق بين الموديلين (مهم تفهموه)
 
-| | rule-based (بدائي) | trained (مدرَّب) |
+| | bridge (بأساس يومي) | trained (مدرَّب) |
 |---|---|---|
-| متى؟ | منتج جديد بلا تاريخ | منتج عليه `sku` أو عنده 90 يوم مبيعات |
+| متى؟ | منتج لسه بيجمّع بيانات (لا مستوى متعلّم ولا تقدير) | منتج عليه `sku` |
 | Endpoint | `/integration/restomind/predict` | `/forecast/weekly` (بـ sku) |
-| الدقة | تقديرية (قواعد + فئة) | عالية (WAPE ~16%) |
-| `modelVersionId` | `restomind-bridge/rule_based-v0.1` | `calendar_decomposed/batch` |
+| الرقم | `baseDailyLevel` (تقدير المالك أو مستوى متعلّم) — من غير مضاعفات تقويم | عالي (WAPE ~16%) مع تقويم |
+| `modelVersionId` | `restomind-bridge/basis-v0.1` | `calendar_decomposed/batch` |
+| لو مفيش أساس | `trainingMessage` + `predictedOrders: 0` | — (أصناف مشهورة) |
 
-الموديل بيتحوّل من البدائي للمدرَّب **تلقائيًا** لكل صنف بعد ما يجمّع 90 يوم مبيعات
+**ملحوظة:** طبقة الـ "rule-based" (قوالب المناسبات) اتشالت خالص من المشروع — مفيش أي رقم مخمّن
+من موديل قديم. لو مفيش بيانات لسه، بيقول "still training" بدل ما يكدّب عليكم.
+
+المنتج بيتحوّل من "بلا توقّع" للموديل المدرَّب **تلقائيًا** لكل صنف بعد ما يجمّع 90 يوم مبيعات
 (عبر `/data/ingest` أو `/integration/restomind/ingest`).
 
 ### إعادة التدريب (Retrain) — مسؤولية مين؟

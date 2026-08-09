@@ -5,11 +5,15 @@ shapes (`productId`, `restaurantId`, `category`, `price`, `freshnessWindow`) and
 model output ready for the Admin/Stores UI -- without touching the backend, which is
 still being built.
 
-Because there is no `sales_transactions` history yet, this runs fully **rule-based**
-(cold start): calendar sensitivities come from the product's category (market priors),
-the demand level comes from the owner's estimate (`avgDailySales`) or a default. When
-real sales exist, the same products flow into the trained model instead -- this bridge is
-the day-one path, not a replacement for it.
+The rule-based cold-start layer (market priors + calendar multipliers) has been
+REMOVED (see HANDOFF.md §8). The bridge no longer invents a quantity from hand-written
+priors. It forecasts from a **basis daily level** only:
+  * a level learned from this restaurant's REAL sales via /integration/restomind/ingest
+    (best - it came from actual history), or
+  * the owner's `avgDailySales` estimate.
+
+A product with neither has no forecast at all: the bridge answers with a "still
+training" message so the caller can plan around the absence instead of trusting a guess.
 
 Two outputs, matching the two screens:
   * production_plan  -> Admin: how much of each product to make on a date, and why.
@@ -20,57 +24,36 @@ Two outputs, matching the two screens:
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
-from app.core.market_priors import category_priors
-from app.core.surplus import SELL_THROUGH_CURVE, expected_sell_through
+from app.core.surplus import expected_sell_through
 from app.marketing.copy import OfferService
-from app.models.rule_based import rule_multiplier
 
 # Every wall-clock quantity this bridge reasons about -- `close_hour`, the
 # sell-through curve's hour index, the calendar's date -- is Cairo local time.
 BUSINESS_TIMEZONE = ZoneInfo("Africa/Cairo")
 
-# Fallback daily level when the owner gives no estimate for a product.
-DEFAULT_DAILY_LEVEL = 40.0
-# Cold-start interval width (same spirit as RuleBasedForecaster).
-INTERVAL_LOW, INTERVAL_HIGH = 0.65, 1.40
-
-# Map a RestoMind category name (Arabic or English, free text) to a market-priors
-# category. Unknown -> "" which resolves to neutral priors. Keyword substring match.
-# Substring keywords -> market-priors category. Order matters (first match wins), so the
-# more specific categories (sweet, savoury) come before the generic bread/bakery bucket.
-_CATEGORY_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
-    (("pastry", "معجن", "كرواسون", "دانش", "croissant", "فطاير"), "pastry"),
-    (("cake", "كيك", "جاتوه", "تورت", "gateau", "gateaux"), "cake"),
-    (("sweet", "حلو", "حلوي", "حلوى", "شرقي", "dessert", "كنافة", "بسبوسة", "قطايف"), "sweet"),
-    (("savoury", "savory", "مالح", "فطير", "سندوت", "sandwich", "feteer", "بيتزا", "pizza"), "savoury"),
-    (("dry", "بسكوت", "بيتي فور", "biscuit", "cookie", "كوكيز"), "dry"),
-    (("seasonal", "موسم", "كحك", "kahk"), "seasonal"),
-    # Bread / bakery goods last -- it is the broadest bucket. "مخبوز" covers مخبوزات.
-    (("bread", "عيش", "خبز", "مخبوز", "بيكري", "bakery", "بان", "توست", "toast"), "bread"),
-]
-
-_offer_service = OfferService()
-
 # Bumped whenever the bridge's prediction logic changes; stored in each prediction so
 # results stay auditable and comparable across versions (maps to RestoMind's
-# prediction.modelVersionId). Cold-start rule-based today; becomes the trained model
-# once real sales history flows through /data/ingest.
-MODEL_VERSION = "restomind-bridge/rule_based-v0.1"
+# prediction.modelVersionId). Today the bridge reports basis levels only.
+MODEL_VERSION = "restomind-bridge/basis-v0.1"
 
+# Output margin when the bridge CAN forecast: a fixed band around the basis level.
+# There is no trained interval on this path (that needs the trained model), so the
+# bounds are deliberately modest rather than implying a calibrated uncertainty.
+BASIS_QUANTUM_LOW, BASIS_QUANTUM_HIGH = 0.9, 1.1
 
-def map_category(name: str | None) -> str:
-    """Best-effort map of a free-text category to a market-priors category."""
-    if not name:
-        return ""
-    low = name.strip().lower()
-    for keywords, mapped in _CATEGORY_KEYWORDS:
-        if any(k in low for k in keywords):
-            return mapped
-    return ""
+# Placed on every response where a product cannot be forecast because it has no
+# basis level (no learnt level and no owner estimate).
+TRAINING_MESSAGE = (
+    "Still training: no basis available for this product yet (no learned demand "
+    "level from real sales and no owner estimate). Post history via "
+    "/integration/restomind/ingest or supply avgDailySales to start forecasting."
+)
+
+_offer_service = OfferService()
 
 
 def _spoilage_severity(freshness_window_days: float | None) -> float:
@@ -98,82 +81,38 @@ class ProductInput:
     category: str | None = None
     price: float = 0.0
     freshness_window: float | None = None   # days; RestoMind Product.freshnessWindow
-    avg_daily_sales: float | None = None     # owner estimate; used until real data exists
-    # Set ONLY when avg_daily_sales is a mean measured over real days. Its presence is
-    # what tells us the figure carries that window's calendar and must be deseasonalised
-    # before the target day's multiplier is applied. Absent = an ordinary-day figure
-    # (an owner's estimate), used as-is.
+    avg_daily_sales: float | None = None     # owner estimate; becomes the basis if no learned level
+    # Retained for API compatibility with RestoMind payloads. Now that the bridge runs
+    # basis levels and applies no calendar multiplier, windows are informational only.
     avg_daily_sales_window: tuple[dt.date, dt.date] | None = None
 
 
-def deseasonalise(
-    raw_mean: float, category: str | None, window: tuple[dt.date, dt.date],
-) -> float:
-    """Convert a raw daily mean measured over `window` into an ordinary-day level.
+def basis_level(p: ProductInput, level: float | None = None) -> float | None:
+    """The daily level to plan from: learned (best) else owner estimate.
 
-    Every `base` this module multiplies by a calendar multiplier must be a QUIET-day
-    level -- the mean of ordinary, non-event days. The registry's learned level already
-    is one, because it averages only non-event days. A caller's measured mean is not:
-    it is averaged over whatever the window happened to contain, weekends and Ramadan
-    included.
-
-    Feeding a raw mean in as `base` therefore applies the calendar twice. A 14-day
-    window sitting inside Ramadan is already inflated by Ramadan, and then gets the
-    Ramadan multiplier on top -- over-forecast, over-produce, waste, during the exact
-    season the product exists to get right.
-
-    Dividing by the window's own mean multiplier undoes that: it recovers the level the
-    window implies for an ordinary day, which the caller's multiplier can then act on.
+    Never falls back to a made-up default: with no learned level and no owner
+    estimate there is no basis for a forecast and `None` is returned (the caller
+    reports "still training").
     """
-    priors = category_priors(map_category(category))
-    start, end = window
-    if end < start:
-        start, end = end, start
-
-    mults: list[float] = []
-    day = start
-    while day <= end:
-        mult, _ = rule_multiplier(priors, CALENDAR.features(day))
-        mults.append(mult)
-        day += dt.timedelta(days=1)
-
-    mean_mult = sum(mults) / len(mults) if mults else 1.0
-    # A degenerate multiplier would turn a real level into an absurd one; leaving the
-    # mean untouched is the safe failure here, not dividing by ~0.
-    if mean_mult <= 0.01:
-        return raw_mean
-    return raw_mean / mean_mult
+    if level is not None:
+        return float(level)
+    if p.avg_daily_sales is not None:
+        # 0.0 is a real answer ("this product sells nothing"), not a missing value.
+        return float(p.avg_daily_sales)
+    return None
 
 
 def _forecast_one(
-    p: "ProductInput", feats: dict, level: float | None = None,
-) -> tuple[float, list[dict]]:
-    """Core rule-based point estimate for one product on one day.
+    p: "ProductInput", level: float | None = None,
+) -> tuple[float | None, list[dict]]:
+    """Basis-level point estimate for one product on one day.
 
-    Shared by the daily production plan and the weekly prediction so both always agree.
-    `level` overrides the daily baseline when a value learned from real sales exists
-    (see the multi-tenant registry); otherwise the owner's estimate / default is used.
-
-    Whatever `base` ends up being, it must be an ORDINARY-day level, because `mult`
-    is applied on top. See `deseasonalise`.
+    Shared by the daily production plan and the weekly prediction so both always
+    agree. Returns `(None, [])` when no basis exists -- the caller must report that
+    product as still training, not invent a number.
     """
-    priors = category_priors(map_category(p.category))
-    mult, factors = rule_multiplier(priors, feats)
-    if level is not None:
-        # Learned from real sales, already averaged over non-event days only.
-        base = level
-    elif p.avg_daily_sales is not None:
-        # 0.0 is a real answer ("this product sells nothing"), not a missing value.
-        base = p.avg_daily_sales
-        if p.avg_daily_sales_window is not None:
-            # The caller measured this over a real window, so it carries that
-            # window's calendar. Strip it back out before re-applying the target
-            # day's. Without the window we must assume an ordinary-day figure --
-            # which is what an owner's estimate is.
-            base = deseasonalise(base, p.category, p.avg_daily_sales_window)
-    else:
-        base = DEFAULT_DAILY_LEVEL
-    return base * mult, factors
+    base = basis_level(p, level)
+    return base, []
 
 
 def production_plan(
@@ -184,36 +123,49 @@ def production_plan(
 
     `levels` maps productId -> (learned_level, mode, confidence) from the registry.
     Where a product has a level learned from that restaurant's real sales, it is used
-    in place of the owner's `avgDailySales` estimate; the calendar multiplier is
-    applied on top either way.
+    in place of the owner's `avgDailySales` estimate. A product with no learned level
+    and no owner estimate has NO recommendation: the response carries a "still
+    training" message instead of a quantity made up from priors.
 
-    Passing `levels=None` keeps the old stateless behaviour (owner estimate only), so
-    a caller with no registry — the tests, and anything calling this directly — is
+    Passing `levels=None` keeps the stateless behaviour (owner estimate only), so a
+    caller with no registry — the tests, and anything calling this directly — is
     unaffected.
     """
-    feats = CALENDAR.features(target_date)
     levels = levels or {}
     out: list[dict] = []
 
     for p in products:
-        level, mode, confidence = levels.get(p.product_id, (None, "rule_based", "low"))
-        qty, factors = _forecast_one(p, feats, level=level)
+        level, mode, confidence = levels.get(p.product_id, (None, "training", "low"))
+        base = basis_level(p, level)
+        if base is None:
+            out.append({
+                "productId": p.product_id,
+                "title": p.title,
+                "date": target_date.isoformat(),
+                "recommendedQty": 0,
+                "lowerBound": 0,
+                "upperBound": 0,
+                "confidence": "low",
+                "source": "training",
+                "levelSource": "none",
+                "baseDailyLevel": 0.0,
+                "factors": [],
+                "trainingMessage": TRAINING_MESSAGE,
+            })
+            continue
         out.append({
             "productId": p.product_id,
             "title": p.title,
             "date": target_date.isoformat(),
-            "recommendedQty": int(round(max(qty, 0))),
-            "lowerBound": int(round(max(qty * INTERVAL_LOW, 0))),
-            "upperBound": int(round(qty * INTERVAL_HIGH)),
+            "recommendedQty": int(round(max(base, 0))),
+            "lowerBound": int(round(max(base * BASIS_QUANTUM_LOW, 0))),
+            "upperBound": int(round(base * BASIS_QUANTUM_HIGH)),
             "confidence": confidence,
             "source": mode,
             "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
-            "baseDailyLevel": round(
-                level if level is not None
-                else (p.avg_daily_sales if p.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL),
-                2,
-            ),
-            "factors": factors,
+            "baseDailyLevel": round(float(base), 2),
+            "factors": [],
+            "trainingMessage": None,
         })
     return out
 
@@ -221,25 +173,47 @@ def production_plan(
 def predict_week(
     restaurant_id: str, product: ProductInput, week_start: dt.date,
     promotion_active: bool = False, level: float | None = None,
-    mode: str = "rule_based", confidence: str = "low",
+    mode: str = "training", confidence: str = "low",
 ) -> dict:
     """Weekly prediction shaped for RestoMind's `predictions` collection.
 
     Mirrors their `prediction` document (`predictedOrders` for a `targetWeek`, plus a
-    `featuresUsed` snapshot for auditability). Deliberately thin and swappable: today it
-    sums the 7-day rule-based forecast; when an item has real history the same call will
-    route through the trained model instead, without changing this contract.
+    `featuresUsed` snapshot for auditability). Forecast is the basis level repeated
+    across the week; the Egyptian calendar is reported in `featuresUsed.calendar` for
+    auditability but no longer multiplies the number (that was the removed rule layer).
 
-    Note vs. their Phase-5 feature list: theirs is autoregressive only (lags/rolling +
-    promo) with NO calendar signal. This bridge adds the Egyptian calendar from the week
-    date -- that is exactly the Ramadan/Eid awareness their feature contract is missing.
+    A product with no basis returns `predictedOrders: 0` and a conspicuous
+    `trainingMessage` -- still training, do not order based on this.
     """
+    base = basis_level(product, level)
+    if base is None:
+        features_used = {
+            "basisProvided": None,
+            "levelSource": "none",
+            "promotionActive": promotion_active,
+            "calendar": _calendar_snapshot(week_start),
+        }
+        return {
+            "restaurantId": restaurant_id,
+            "productId": product.product_id,
+            "modelVersionId": MODEL_VERSION,
+            "targetWeek": week_start.isoformat(),
+            "predictedOrders": 0,
+            "confidence": "low",
+            "trainingMessage": TRAINING_MESSAGE,
+            "featuresUsed": features_used,
+            "factors": [],
+            "dailyBreakdown": [
+                {"date": (week_start + dt.timedelta(days=i)).isoformat(),
+                 "predictedQuantity": 0, "qty": 0, "factors": []}
+                for i in range(7)
+            ],
+        }
+
     daily: list[dict] = []
     for i in range(7):
         d = week_start + dt.timedelta(days=i)
-        feats = CALENDAR.features(d)
-        qty, factors = _forecast_one(product, feats, level=level)
-        rounded = int(round(max(qty, 0)))
+        rounded = int(round(max(base, 0)))
         daily.append({
             "date": d.isoformat(),
             # `predictedQuantity` is the canonical name -- it matches RestoMind's
@@ -247,41 +221,20 @@ def predict_week(
             "predictedQuantity": rounded,
             # DEPRECATED alias, kept one release so existing clients do not break.
             "qty": rounded,
-            "factors": factors,
+            "factors": [],
         })
     # Sum the rounded daily values so the weekly total always reconciles with the breakdown.
     total = sum(day["predictedQuantity"] for day in daily)
 
     # Feature snapshot -- what actually fed the prediction, for auditability.
-    week_feats = CALENDAR.features(week_start)
     features_used = {
         "modelVersion": MODEL_VERSION,
         "mode": mode,
-        "baseDailyLevel": round(
-            level if level is not None
-            else (product.avg_daily_sales if product.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL),
-            2,
-        ),
+        "baseDailyLevel": round(float(base), 2),
         "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
-        "categoryResolved": map_category(product.category) or "neutral",
         "promotionActive": promotion_active,
-        "calendar": {
-            "isRamadan": bool(week_feats["is_ramadan"]),
-            "isEidFitr": bool(week_feats["is_eid_fitr"]),
-            "isKahkWindow": bool(week_feats["is_kahk_window"]),
-            "daysToEidFitr": (
-                int(week_feats["days_to_eid_fitr"]) if week_feats["days_to_eid_fitr"] < 999 else None
-            ),
-        },
+        "calendar": _calendar_snapshot(week_start),
     }
-
-    # Distinct calendar drivers across the week, strongest first.
-    seen: dict[str, dict] = {}
-    for day in daily:
-        for f in day["factors"]:
-            if f["factor"] not in seen or abs(f["impact_pct"]) > abs(seen[f["factor"]]["impact_pct"]):
-                seen[f["factor"]] = f
-    factors = sorted(seen.values(), key=lambda f: abs(f["impact_pct"]), reverse=True)
 
     return {
         "restaurantId": restaurant_id,
@@ -290,9 +243,23 @@ def predict_week(
         "targetWeek": week_start.isoformat(),
         "predictedOrders": int(total),
         "confidence": confidence,
+        "trainingMessage": None,
         "featuresUsed": features_used,
-        "factors": factors,
+        "factors": [],
         "dailyBreakdown": daily,
+    }
+
+
+def _calendar_snapshot(day: dt.date) -> dict:
+    """Calendar state for the week's start date, mirroring it into the audit trail."""
+    feats = CALENDAR.features(day)
+    return {
+        "isRamadan": bool(feats["is_ramadan"]),
+        "isEidFitr": bool(feats["is_eid_fitr"]),
+        "isKahkWindow": bool(feats["is_kahk_window"]),
+        "daysToEidFitr": (
+            int(feats["days_to_eid_fitr"]) if feats["days_to_eid_fitr"] < 999 else None
+        ),
     }
 
 
@@ -339,8 +306,9 @@ def surplus_offers(
 
     `levels` maps productId -> (learned_level, mode, confidence) from the registry. A
     learned level replaces the owner's estimate when computing expected sell-through,
-    which is what decides whether stock is at risk at all — so the same ingested sales
-    that move the forecast also move the discount. `None` keeps the old behaviour.
+    which is what decides whether stock is at risk at all -- an owner estimate or
+    learned level is the basis for expected sales. A product with no basis is skipped
+    (no foundation to judge risk).
     """
     levels = levels or {}
     # Normalise before ANY wall-clock read: `.hour`, `.minute` and `.date()` below
@@ -353,29 +321,15 @@ def surplus_offers(
     for s in stock:
         if s.current_stock <= 0:
             continue
-        priors = category_priors(map_category(s.category))
-        mult, _ = rule_multiplier(priors, CALENDAR.features(now.date()))
+        learned_level, _, _ = levels.get(s.product_id, (None, "training", "low"))
+        base = basis_level(s, level=learned_level)
+        if base is None:
+            # No basis -> no expected sell-through -> risk cannot be judged. Skip.
+            continue
         # `or` is a truthy test, so an honest 0.0 ("this product sells nothing")
-        # was silently replaced by DEFAULT_DAILY_LEVEL (40/day) -- exactly the
-        # dead-slow stock that most needs discounting was given a healthy
-        # expected sell-through, driving projected_surplus to 0 and skipping it
-        # below. `_forecast_one` already distinguishes the two; match it.
-        # A level learned from this restaurant's own sales beats the owner's
-        # estimate, exactly as in _forecast_one. Both are quiet-day levels, so the
-        # calendar multiplier still applies on top.
-        learned_level, _, _ = levels.get(s.product_id, (None, "rule_based", "low"))
-        if learned_level is not None:
-            base_level = learned_level
-        elif s.avg_daily_sales is not None:
-            base_level = s.avg_daily_sales
-            # `mult` is applied below, so base_level must be an ordinary-day level.
-            # Same double-count as _forecast_one otherwise.
-            if s.avg_daily_sales_window is not None:
-                base_level = deseasonalise(base_level, s.category, s.avg_daily_sales_window)
-        else:
-            base_level = DEFAULT_DAILY_LEVEL
-        day_level = base_level * mult
-        expected_remaining = day_level * remaining_share
+        # must not be replaced by anything. `basis_level` keeps 0.0 distinct from a
+        # missing value, and `base` is used exactly as given.
+        expected_remaining = base * remaining_share
 
         projected_surplus = max(0.0, s.current_stock - expected_remaining)
         raw_risk = projected_surplus / s.current_stock

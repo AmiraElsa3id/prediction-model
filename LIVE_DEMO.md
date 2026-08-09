@@ -2,7 +2,7 @@
 
 Proven working end-to-end: the model reads RestoMind's real MongoDB data and writes
 predictions back where their system expects them. This is a genuine service-to-service
-loop, not a mock. All figures are still SIMULATED/rule-based (no real sales history).
+loop, not a mock. All figures are still SIMULATED (no real sales history).
 
 ## What runs
 
@@ -38,7 +38,7 @@ collection.
 
 Instead of the 5-product cold-start demo, seed the same 11 items + 2 years of daily sales
 that the model actually trained on, so their DB looks like an established bakery and
-predictions come from the TRAINED model (not the cold-start rules):
+predictions come from the TRAINED model (not the cold-start "still training" state):
 
 ```bash
 # Seed 11 products (each linked to a trained SKU) + 8,019 sales_transactions into their Mongo
@@ -60,7 +60,8 @@ Verified trained-model output stored in their `predictions` (modelVersionId
 | بسبوسة (basbousa) | 1111 | **2151** ↑ (×2) |
 
 `connect_restomind.py` picks the path per product: `product.sku` present → trained
-`/forecast/weekly`; otherwise → cold-start rule-based `/integration/restomind/predict`.
+`/forecast/weekly`; otherwise → the bridge `/integration/restomind/predict` (basis level,
+or "still training" when there is no basis).
 
 ## Persistence (survives restart)
 
@@ -86,7 +87,7 @@ Without `REGISTRY_STORE` the registry stays in-memory (tests use this, so they'r
 - ✅ Persistence across restart.
 - 🟡 The connector talks to Mongo directly (their Phase-5 `predictions` module isn't built
   yet). When they build it, it calls the same model endpoint — no change our side.
-- 🟡 Predictions are rule-based + calendar (no real sales history). Trained-model-per-
+- 🟡 Predictions are basis-level only (no real sales history). Trained-model-per-
   restaurant is the next step (HANDOFF §9).
 - Numbers are SIMULATED, not measured. Real proof still needs a pilot.
 

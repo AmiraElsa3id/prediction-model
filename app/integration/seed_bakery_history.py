@@ -26,7 +26,7 @@ from app.core.items import CATALOGUE
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://127.0.0.1:27017/restomind")
 RESTAURANT_NAME = "مخبز المحاكاة الكاملة"
 
-# RestoMind category name per our internal category (Arabic, so map_category resolves it).
+# RestoMind category name per our internal category (Arabic, so the bridge can carry them).
 CATEGORY_AR = {
     "bread": "مخبوزات", "pastry": "معجنات", "cake": "كيك", "sweet": "حلويات شرقية",
     "savoury": "مالح", "seasonal": "موسمي", "dry": "بيسكوت",

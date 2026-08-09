@@ -46,7 +46,7 @@ class ForecastResponse(BaseModel):
     lower_bound: int = Field(..., description="10th percentile of predicted demand")
     upper_bound: int = Field(..., description="90th percentile of predicted demand")
     confidence: str = Field(..., description="'high' | 'medium' | 'low'")
-    source: str = Field(..., description="'batch' | 'online' | 'prior'")
+    source: str = Field(..., description="'batch'")
     factors: list[Factor] = Field(
         default_factory=list, description="Why the number differs from a normal day"
     )
@@ -142,7 +142,7 @@ class IngestRequest(BaseModel):
     records: list[SalesRecord] = Field(
         ..., min_length=1,
         description="End-of-day actuals. The backend posts these each night so history "
-                    "accumulates and items promote from rule-based to the trained model.",
+                    "accumulates and items promote from untrained to the trained model.",
     )
 
 
@@ -157,7 +157,7 @@ class IngestResponse(BaseModel):
 
 class ItemModeStatus(BaseModel):
     sku: str
-    mode: str = Field(..., description="'rule_based' or 'trained_model'")
+    mode: str = Field(..., description="'untrained' or 'trained_model'")
     observed_days: int
     days_until_switch: int = Field(..., description="Days of data still needed; 0 if trained")
     progress: float = Field(..., description="observed_days / threshold, capped at 1.0")
@@ -166,7 +166,7 @@ class ItemModeStatus(BaseModel):
 class ModelStatusResponse(BaseModel):
     train_threshold_days: int
     model_trained_at: str | None
-    items_rule_based: int
+    items_untrained: int
     items_trained: int
     items: list[ItemModeStatus]
 
@@ -346,10 +346,8 @@ class RMProduct(BaseModel):
         None,
         description=(
             "Set ONLY when avgDailySales is a mean measured over real days, giving the "
-            "window it was measured over. We divide out that window's own calendar "
-            "effect before applying the target day's -- otherwise a mean measured "
-            "during Ramadan gets the Ramadan multiplier applied a second time. Omit "
-            "for an owner's estimate, which is already an ordinary-day figure."
+            "window it was measured over. Informational: since the rule-based calendar "
+            "multipliers were removed, no de-seasonalising is applied."
         ),
     )
 
@@ -370,10 +368,13 @@ class RMPlanItem(BaseModel):
     confidence: str
     source: str
     # Whether this quantity came from the restaurant's own sales or the owner's
-    # estimate. Without it a plan cannot be told apart from a cold-start guess.
+    # estimate. Without it a plan cannot be told apart from a guess.
     levelSource: str = "owner_estimate"
     baseDailyLevel: float = 0.0
     factors: list[Factor]
+    # Present when the product has NO basis (no learned level, no owner estimate): the
+    # bridge says so explicitly instead of inventing a quantity from priors.
+    trainingMessage: str | None = None
 
 
 class RMProductionPlanResponse(BaseModel):
@@ -428,9 +429,9 @@ class RMPredictRequest(BaseModel):
     avgDailySalesWindow: DateWindow | None = Field(
         None,
         description=(
-            "Set ONLY when avgDailySales is a mean measured over real days. See "
-            "RMProduct.avgDailySalesWindow -- without it a mean measured during "
-            "Ramadan gets the Ramadan multiplier applied twice."
+            "Set ONLY when avgDailySales is a mean measured over real days. "
+            "Informational: the rule-based calendar multipliers are gone, so no "
+            "de-seasonalising is applied."
         ),
     )
     promotionActive: bool = Field(False, description="Is a discount offer live this week?")
@@ -446,8 +447,10 @@ class RMPredictResponse(BaseModel):
     predictedOrders: int = Field(..., description="Predicted total units for the week")
     confidence: str
     featuresUsed: dict = Field(..., description="Snapshot of inputs, for auditability")
-    factors: list[Factor] = Field(..., description="Calendar drivers behind the number")
+    factors: list[Factor] = Field(..., description="Drivers behind the number (empty post-rule)")
     dailyBreakdown: list[dict] = Field(..., description="Per-day predicted units")
+    # Present when the product has no basis to forecast from: still training.
+    trainingMessage: str | None = None
 
 
 class RMSalesRow(BaseModel):

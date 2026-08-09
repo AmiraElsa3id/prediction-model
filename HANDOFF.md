@@ -48,11 +48,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.api.main:app           # API + Swagger at /docs (trains on startup, ~20s)
 .venv/bin/streamlit run dashboard.py         # investor dashboard
 ```
-Env vars: `COLD_START=true` (start with no history, fully rule-based), `CORS_ORIGINS` (default `http://localhost:3000`),
-`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy + priors),
+Env vars: `COLD_START=true` (start with no history — every item untrained, no forecast until
+90 days), `CORS_ORIGINS` (default `http://localhost:3000`),
+`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy),
 `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing).
 
-**Status: 79 tests passing.** Do not mark work done unless tests pass.
+**Status: 107 tests passing.** Do not mark work done unless tests pass.
 
 ---
 
@@ -70,20 +71,16 @@ app/
     features.py         Cleaning (reconcile stock, closed-vs-zero, outlier flag that spares
                         calendar spikes), lag/rolling/calendar features, censored-demand mask,
                         clean_baseline (event-free baseline for multiplier fitting).
-    evaluation.py       WAPE/MASE/pinball/bias + rolling-origin backtest + per-item scores.
+evaluation.py       WAPE/MASE/pinball/bias + rolling-origin backtest + per-item scores.
     surplus.py          Near-closing surplus detection + discount tiers + sell-through curve.
-    market_priors.py    LLM/market-analysis calendar sensitivities per category+item.
-                        load_priors(), category_priors(), generate_priors_llm() (LLM+fallback).
   models/
     seasonality.py      CalendarEffects: per-item calendar multipliers via Ridge in log space
                         (calendar-only design matrix, NO lags). explain() = exact attribution.
     forecaster.py       SeasonalNaive, MovingAverage, LightGBMQuantile, and CalendarDecomposed
                         (THE production model — see §4).
-    rule_based.py       RuleBasedForecaster: cold-start using market_priors + owner level.
-                        rule_multiplier(priors, feats) -> (mult, factors).
-    service.py          ForecastService: HYBRID routing (rule-based <90 days, trained >=90),
-                        ingestion, retrain, intervals, explanations, /model/status. The
-                        API's model layer.
+    service.py          ForecastService: threshold-gated routing (below `TRAIN_THRESHOLD_DAYS`
+                        there is NO forecast — no rule layer remains), ingestion, retrain,
+                        intervals, explanations, /model-status. The API's model layer.
   marketing/
     copy.py             OfferService: Egyptian-Arabic offer copy (LLM + template fallback +
                         _validate). build() for SKUs, build_freeform() for arbitrary products.
@@ -102,10 +99,9 @@ scripts/
     run_backtest.py     Model comparison (all models, both horizons).
     run_simulation.py   Business simulation -> EGP saved vs the manager baseline.
 dashboard.py            Streamlit investor demo (4 tabs).
-tests/                  79 tests across 7 files (see §6).
+tests/                  107 tests across 9 files (see §6).
 data/
     synthetic_pos.parquet   generated dataset
-    market_priors.json      LLM-generated calendar sensitivities (the "analysis result")
     models/                 pickled models (if saved)
 test/                   CLONED CLIENT REPOS (RestoMindAPI backend, restomind-app frontend)
 postman_collection.json 12 requests w/ Arabic docs + auto-tests (import into Postman/newman)
@@ -149,19 +145,26 @@ Decisions, each learned the hard way — do not "simplify" them away:
 
 ---
 
-## 5. Cold-start → trained hybrid (the "rule-based then train" flow the owner asked for)
+## 5. Training threshold → trained model (no rule-based cold start)
 
-- **Rule-based (day 0):** every item forecasts from `market_priors.json` (calendar
-  sensitivities by category) × owner's `avgDailySales`. Knows Ramadan/Eid with no data.
-- **Ingest:** backend POSTs nightly actuals to `POST /data/ingest`. `ForecastService`
-  counts days per item and refreshes rule baselines immediately.
-- **Switch at 90 days/item** (`TRAIN_THRESHOLD_DAYS`, configurable): item promotes to the
-  trained `CalendarDecomposed` model automatically.
-- **Event-aware safety net:** even a trained item keeps using the RULES for a major event
-  (Ramadan/Eid/kahk/Sham) it has NOT yet seen in its training window — so switching never
-  makes a holiday forecast worse. It takes over that event only after living through it.
-- `GET /model/status` shows each item's mode + progress. `service.py` methods: `train`,
-  `start_cold`, `ingest`, `_use_ml(sku, date)`, `status`.
+> The rule-based cold-start layer was REMOVED in this change (see §8). A fresh bakery has
+> **NO forecast until an item both has a model and crosses the training threshold.**
+
+- **Rule-based layer gone.** `rule_based.py`, `market_priors.py` and
+  `data/market_priors.json` were deleted; `rule_multiplier()`/`category_priors()`/
+  `map_category()`/`deseasonalise()` no longer exist anywhere.
+- **Below `TRAIN_THRESHOLD_DAYS` (90) an item has NO forecast.** `ForecastService.forecast()`
+  raises `ModelNotReadyError`; the API answers **409 "still training"** so the caller keeps
+  its own estimator rather than trusting a number minted from nothing.
+- **Ingest:** backend POSTs nightly actuals to `POST /data/ingest`. `ForecastService` counts
+  days per item and retrains when an item crosses the threshold.
+- **Switch at 90 days/item:** the trained `CalendarDecomposed` model serves that item
+  automatically.
+- **Unseen major event:** even a trained item has ~zero learned effect for a Ramadan it has
+  never seen in its window. The model still forecasts that day but marks it `low`
+  confidence and WIDENS the interval — there is no rule path left to defer to.
+- `GET /model/status` shows each item's mode (`untrained`|`trained_model`) + progress.
+  `service.py` methods: `train`, `start_cold`, `ingest`, `_use_ml(sku)`, `status`.
 
 ---
 
@@ -179,13 +182,13 @@ Alerts/surplus/marketing: `POST /alerts/waste-prevention`, `/surplus/detect`,
   `/integration/restomind/ingest` (per-restaurant sales → learns real levels),
   `GET /integration/restomind/status/{restaurant_id}` (which products use learned vs estimate)
 
-Every forecast response carries `confidence`, `source` (rule_based|batch), interval, and
-`factors` (calendar attribution) — the explanation is what makes managers trust it.
+Every forecast response carries `confidence`, `source` (batch), interval, and `factors`
+(calendar attribution) — the explanation is what makes managers trust it.
 
-Tests (**83 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
+Tests (**107 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
 (effect recovery), `test_forecaster` (decomposition anticipates Ramadan, beats naive),
-`test_hybrid` (cold-start→trained + event-aware routing), `test_market_priors`,
-`test_api` (all endpoints), `test_restomind_bridge` (the bridge), `test_registry`
+`test_hybrid` (threshold gate: no forecast while training, then model), `test_api` (all
+endpoints), `test_restomind_bridge` (basis-level bridge + timezone), `test_registry`
 (seeding sales changes predictions + per-tenant isolation). Postman: 17 requests,
 run via `npx newman run postman_collection.json --env-var "baseUrl=http://127.0.0.1:PORT"`.
 
@@ -212,11 +215,13 @@ Cloned into `test/RestoMindAPI` (backend) and `test/restomind-app` (frontend).
   OUTPUT GOES.** Their backend calls "the AI service" (= us) with computed features and
   stores our `predictedOrders`. `/integration/restomind/predict` already returns this shape.
 - **CRITICAL nuance:** their planned feature list (Phase 5) is autoregressive only
-  (lags/rolling/promo) with **NO calendar features** — the exact weakness we solved. Our
-  bridge ADDS the Egyptian calendar from `targetWeek`. Recommended integration: backend
-  sends raw sales via `/data/ingest` + asks predictions by date, and OUR model computes
-  calendar itself (preserves the 28% edge). Their weekly `targetWeek` vs our daily is
-  reconciled by summing 7 days in `predict_week()`.
+  (lags/rolling/promo) with **NO calendar features** — the exact weakness we solved for the
+  trained model. Recommended integration: backend sends raw sales via `/data/ingest` + asks
+  predictions by date, and OUR model computes calendar itself (preserves the 28% edge).
+  The bridge's weekly `targetWeek` vs our daily is reconciled by summing 7 days in
+  `predict_week()`. **_Note:_** the bridge itself no longer applies a calendar multiplier
+  (rule layer removed) — it reports the basis level; only the trained model carries
+  calendar awareness.
 - Their AI pipeline is Phases 5/6/8: predictions → waste-reports/recommendations → offers
   → reconcile actuals & accuracy. Bridge is designed to slot into this.
 
@@ -236,17 +241,30 @@ per-restaurant products (currently trained path only works for the 11 known SKUs
 
 ---
 
-## 8. Market priors — dynamic per restaurant (`market_priors.json` + `market_priors.py`)
+## 8. REMOVED — rule-based market priors (`market_priors.py` + `market_priors.json`)
 
-Calendar sensitivities are **category-level** (transferable: all desserts spike in Ramadan)
-+ **item overrides** (konafa is THE Ramadan sweet). The FILE is the "LLM analysis result" —
-editing it changes forecasts immediately (verified: croissant Ramadan 146→58 when tweaked).
-`generate_priors_llm()` can regenerate from a real menu via a free-tier LLM, with validation
-+ fallback. Levels (units/day) come from onboarding, NOT the LLM. Everything self-corrects
-from data after 90 days.
+**Removed from the forecast path.** The cold-start layer it drove (`rule_based.py`) and its
+data file (`data/market_priors.json`) are gone (P11: "remove the rule-based cold-start from
+the model, without affecting the trained path").
+
+What this means:
+- `category_priors()`, `generate_priors_llm()`, `rule_multiplier()`, `map_category()` and
+  `deseasonalise()` no longer exist. Any caller that imported them breaks at import time —
+  only `app/integration/restomind.py`, `tests/test_market_priors.py` and
+  `tests/test_registry.py` used them, all updated/removed.
+- The bridge (`restomind.py`) now forecasts from a **basis daily level only** — a learned
+  level from `/integration/restomind/ingest` (best), else the owner's `avgDailySales`
+  estimate. No calendar multiplier is applied. A product with no reason at all is answered
+  with a "still training" `trainingMessage` and `recommendedQty`/`predictedOrders` of 0.
+- The trained `CalendarDecomposed` model keeps its own calendar multipliers (learned from
+  data, not hand-written priors) — that layer is untouched.
+
+`generate_priors_llm()` (regenerating sensitivities from a real menu) was the input to that
+now-deleted layer; if we ever want a priors-based fallback again it would be rebuilt from
+data on the trained side.
 
 **Location-based dynamic (discussed, NOT built):** country-level calendar (weekend days +
-national holidays via a `holidays`-style lib + existing Hijri) is the big lever and is
+national per-day holiday lib + Hijri) is still the big lever for the trained model and is
 moderate effort. City/weather = optional. Hyper-local = learned from data automatically.
 
 ---
@@ -258,11 +276,10 @@ moderate effort. City/weather = optional. Hyper-local = learned from data automa
 2. **Live RestoMind wiring** — boot their NestJS + MongoDB, connect to this service, test
    end-to-end. Needs their env/DB. Optionally build a connector that reads
    `sales_transactions` and feeds `/data/ingest` so seeding real data actually moves the model.
-3. **Multi-tenant model registry** — PARTIALLY DONE: `integration/registry.py` now keys
-   state by `restaurantId` and learns the per-product demand LEVEL from ingested sales
-   (rule-based calendar shape still). Remaining: wire the full trained `CalendarDecomposed`
-   model per restaurant (needs per-product economics generalised off the built-in catalogue,
-   and persistence — it's in-memory now).
+3. **Multi-tenant model registry** — PARTIALLY DONE: `integration/registry.py` keys
+   state by `restaurantId` and learns the per-product demand LEVEL from ingested sales.
+   Remaining: wire the full trained `CalendarDecomposed` model per restaurant (needs
+   per-product economics generalised off the built-in catalogue).
 4. **Ingredient-level forecasting** — use `Recipe` (bill of materials) to convert product
    demand → ingredient purchasing forecast; use `freshnessWindow`/`shelfLifeDays` instead of
    hardcoded shelf life. Unlocks à-la-carte restaurants (waste is at ingredient level).
