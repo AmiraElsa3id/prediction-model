@@ -21,7 +21,10 @@ that stays true with this store.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Protocol
+
+_log = logging.getLogger(__name__)
 
 
 class RegistryStore(Protocol):
@@ -105,3 +108,73 @@ class MongoRegistryStore:
 
     def close(self) -> None:
         self._client.close()
+
+
+class DualRegistryStore:
+    """Writes every save to a primary store AND mirrors it to a secondary one.
+
+    Satisfies `RegistryStore`, so `RestaurantRegistry` cannot tell it apart from a
+    single backend. Wired up when both MONGO_URL and REGISTRY_STORE are configured
+    (see `app/api/main.py`).
+
+    The two halves are deliberately NOT equal partners:
+
+    * **Primary is the source of truth.** A failed primary write propagates and fails
+      the request -- silently losing a restaurant's learned levels is the exact failure
+      this whole persistence layer exists to prevent.
+    * **The mirror is best-effort.** A failed mirror write is logged and swallowed. A
+      full disk or a locked file must not take down a service whose real store is
+      healthy; the alternative trades one durable copy for zero availability.
+
+    So the mirror is a convenience copy (inspect it by eye, keep a local snapshot),
+    never a second authority. If you need both to be authoritative you need a
+    distributed transaction, which is far more machinery than a dev-convenience mirror
+    justifies.
+    """
+
+    def __init__(self, primary: "RegistryStore", mirror: "RegistryStore") -> None:
+        self.primary = primary
+        self.mirror = mirror
+
+    def load_all(self) -> dict[str, dict]:
+        """Primary wins. The mirror is read ONLY when the primary is entirely empty.
+
+        That one case is the migration path: an existing JSON file's history is adopted
+        by a fresh Mongo on first boot, and written back to Mongo on the next save.
+
+        It is deliberately all-or-nothing rather than a per-restaurant merge. Merging
+        would resurrect a restaurant deleted from the primary just because a stale
+        mirror still listed it -- silently, and with no way to ever delete it again.
+        """
+        primary_state = self.primary.load_all()
+        if primary_state:
+            return primary_state
+
+        mirror_state = self.mirror.load_all()
+        if mirror_state:
+            _log.warning(
+                "Registry primary store is empty; adopting %d restaurant(s) from the "
+                "mirror. This is expected on a first run against a fresh primary, and "
+                "unexpected afterwards -- if you see it on every boot, the primary's "
+                "writes are not landing.",
+                len(mirror_state),
+            )
+        return mirror_state
+
+    def save_restaurant(self, restaurant_id: str, doc: dict) -> None:
+        # Primary first, and un-caught: if the durable copy did not land, the caller
+        # must hear about it rather than be reassured by a successful mirror write.
+        self.primary.save_restaurant(restaurant_id, doc)
+
+        try:
+            self.mirror.save_restaurant(restaurant_id, doc)
+        except Exception as exc:
+            # Broad on purpose. The mirror can be any RegistryStore, so the failures are
+            # open-ended (OSError, PermissionError, a driver error), and every one of
+            # them has the same correct response: the primary already succeeded, so the
+            # data is safe -- say so and carry on.
+            _log.warning(
+                "Registry mirror write failed for restaurant %s (%s: %s). The primary "
+                "store succeeded, so no data was lost; the mirror is now stale.",
+                restaurant_id, type(exc).__name__, exc,
+            )

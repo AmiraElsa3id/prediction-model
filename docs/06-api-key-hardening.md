@@ -18,12 +18,11 @@ OUT of scope for this doc — tracked separately, ignore them while implementing
 Today (`app/api/main.py`), exactly one thing is authenticated: the RestoMind integration
 routes (`/integration/restomind/*`), and only if the `AI_SHARED_SECRET` env var happens to
 be set — if it's unset, those routes are open. Every other route
-(`/forecast/*`, `/data/ingest`, `/marketing/generate-offer`, `/marketing/publish`,
+(`/forecast/*`, `/data/ingest`,
 `/surplus/detect`, `/alerts/waste-prevention`) has **no auth at all**, unconditionally.
 
 For a microservice whose only legitimate caller is our own backend, "no auth" means
-"anyone who can route a packet to this port has full access" — including triggering a
-real Facebook post via `/marketing/publish` if the Meta env vars are ever turned on, or
+"anyone who can route a packet to this port has full access" — including
 poisoning another tenant's learned demand levels via the registry endpoints. Network
 isolation (private subnet, no public ingress) is the first line of defense, but it
 shouldn't be the *only* one — a misconfigured security group, a debug port left open, or
@@ -77,7 +76,7 @@ deliberate, not a shortcut:
   (`status`, whether the model is trained, item count, and the fact that data is
   simulated — see `app/api/main.py:136-144`).
 - Every other route — all of `/forecast/*`, `/data/ingest`, `/model/status`,
-  `/alerts/waste-prevention`, `/surplus/detect`, `/marketing/*`, and all of
+  `/alerts/waste-prevention`, `/surplus/detect`, and all of
   `/integration/restomind/*` — requires the key.
 - `/docs`, `/redoc`, `/openapi.json` (FastAPI's auto-generated Swagger UI): **decide
   before implementing** whether these stay open or require the key too. Recommendation:
@@ -173,7 +172,7 @@ Do not:
   (DB credentials, Meta tokens, etc.) — a secrets manager or environment-injected config,
   never a committed file. This key is exactly as sensitive as those.
 - **This service side:** `API_KEY` environment variable, injected by whatever deploys this
-  service (same mechanism as `META_ACCESS_TOKEN` today). Never written to
+  service (same mechanism as other secrets today). Never written to
   `data/registry.json` or any log line — audit the code for accidental logging of request
   headers before shipping this (FastAPI/Starlette don't log headers by default, but
   double-check any custom logging middleware added later doesn't start).
@@ -255,7 +254,7 @@ will have moved on by the time this is picked up.
 ## 6. Docs to update once this is built
 
 - `README.md`'s env var table (currently documents `CORS_ORIGINS`,
-  `META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED`, etc.) — add `API_KEY_HASH`
+  optional publish credentials, etc.) — add `API_KEY_HASH`
   and `REQUIRE_API_KEY` (and note that the raw key itself is never an env var on this
   service — see §2.2), and remove `AI_SHARED_SECRET` per §2.5 (removed, not deprecated).
 - `HANDOFF.md` §2 (env vars list) and §6 (endpoint list) — note that all routes except

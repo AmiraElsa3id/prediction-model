@@ -29,7 +29,7 @@ backward-compatible fallback.
 
 Change every outgoing HTTP call this backend makes to the AI service (all of
 `/forecast/*`, `/data/ingest`, `/model/status`, `/alerts/waste-prevention`,
-`/surplus/detect`, `/marketing/*`, and all `/integration/restomind/*` routes) to include:
+`/surplus/detect`, and all `/integration/restomind/*` routes) to include:
 
 ```
 X-API-Key: <the raw key — see §2.2 for where it comes from>
@@ -108,9 +108,6 @@ HTTP status `429`, with a `Retry-After` header (seconds until the limit's window
   exactly the failure pattern this rate limit exists to catch — retrying into an active
   429 just keeps the backend rate-limited longer and makes the underlying problem worse,
   not better. If retrying at all, respect `Retry-After` and back off.
-- `/marketing/generate-offer` and `/marketing/publish` have a noticeably tighter budget
-  than every other route (real per-call LLM cost / a real Facebook post) — expect 429s
-  there sooner than on `/forecast/*` if something is calling them in a loop.
 
 ### 2.4 Key rotation is manual, coordinate before it happens
 

@@ -37,7 +37,6 @@ from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
 from app.core.surplus import expected_sell_through
-from app.marketing.copy import OfferService
 from app.models.service import ModelNotReadyError
 
 if TYPE_CHECKING:
@@ -65,8 +64,6 @@ TRAINING_MESSAGE = (
     "level from real sales and no owner estimate). Post history via "
     "/integration/restomind/ingest or supply avgDailySales to start forecasting."
 )
-
-_offer_service = OfferService()
 
 
 def _spoilage_severity(freshness_window_days: float | None) -> float:
@@ -412,11 +409,10 @@ def surplus_offers(
     restaurant_id: str, stock: list[StockInput], now: dt.datetime, close_hour: int = 22,
     levels: dict[str, tuple[float | None, str, str]] | None = None,
 ) -> list[dict]:
-    """Near-closing surplus per product, with a discount and Egyptian-Arabic copy.
+    """Near-closing surplus per product, with a suggested discount.
 
     Risk = the share of current stock we do not expect to sell before closing, weighted
-    by perishability (from `freshnessWindow`). Offer copy comes from the same generator
-    the marketing endpoint uses (LLM + template fallback).
+    by perishability (from `freshnessWindow`).
 
     `levels` maps productId -> (learned_level, mode, confidence) from the registry. A
     learned level replaces the owner's estimate when computing expected sell-through,
@@ -456,10 +452,6 @@ def surplus_offers(
         # without cost -- so cap at a sane maximum instead.
         discount = 40 if raw_risk >= 0.8 else 30 if raw_risk >= 0.6 else 20 if raw_risk >= 0.4 else 10
 
-        offer = _offer_service.build_freeform(
-            title_ar=s.title, price=s.price, discount_pct=discount,
-        ) if s.price > 0 else None
-
         results.append({
             "productId": s.product_id,
             "title": s.title,
@@ -469,8 +461,6 @@ def surplus_offers(
             "urgency": "high" if risk > 0.6 else "medium" if risk > 0.3 else "low",
             "hoursToClose": round(hours_left, 1),
             "suggestedDiscountPct": discount,
-            "offerCopyAr": offer["copy_ar"] if offer else None,
-            "newPrice": offer["new_price"] if offer else None,
         })
 
     return sorted(results, key=lambda r: r["riskScore"], reverse=True)

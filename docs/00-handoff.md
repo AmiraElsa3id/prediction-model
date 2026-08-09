@@ -50,11 +50,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 Env vars: `COLD_START=true` (start with no history — every item untrained, no forecast until
 it crosses the training threshold),
-`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` (free-tier LLM for Arabic copy),
-`META_PAGE_ID`/`META_ACCESS_TOKEN`/`META_PUBLISH_ENABLED` (live publishing),
 `REQUIRE_API_KEY`/`API_KEY_HASH` (API key auth, see `docs/01-api-key-hardening.md`; unset in
 dev, auth is skipped; `API_KEY_HASH` is a SHA-256 hash, never the raw key),
-`RATE_LIMIT_DEFAULT_PER_MIN`/`RATE_LIMIT_MARKETING_PER_MIN`/`RATE_LIMIT_WINDOW_SECONDS`
+`RATE_LIMIT_DEFAULT_PER_MIN`/`RATE_LIMIT_WINDOW_SECONDS`
 (cost-guard rate limit overrides, see `docs/03-cors-and-rate-limiting.md`; unset falls
 back to 300/20/60 -- not a real per-user limiter, just a ceiling against runaway cost).
 No `CORS_ORIGINS` anymore -- this service is never called from a browser directly, so
@@ -88,10 +86,6 @@ evaluation.py       WAPE/MASE/pinball/bias + rolling-origin backtest + per-item 
     service.py          ForecastService: threshold-gated routing (below `TRAIN_THRESHOLD_DAYS`
                         there is NO forecast — no rule layer remains), ingestion, retrain,
                         intervals, explanations, /model-status. The API's model layer.
-  marketing/
-    copy.py             OfferService: Egyptian-Arabic offer copy (LLM + template fallback +
-                        _validate). build() for SKUs, build_freeform() for arbitrary products.
-    publisher.py        MetaPublisher: Graph API, dry-run by default, 3 gates for live post.
   integration/
     restomind.py        BRIDGE to the client's system: maps RestoMind product/restaurant
                         shapes -> model output. production_plan(), surplus_offers(),
@@ -184,15 +178,14 @@ data moves them; re-run the script before quoting them.
 All routes require `X-API-Key` except `GET /health`, once `REQUIRE_API_KEY`/`API_KEY_HASH`
 are set (see `docs/01-api-key-hardening.md`; unset in dev, so this is a no-op locally).
 Every route except `/health` also sits behind an always-on cost-guard rate limit (429 +
-`Retry-After` past the ceiling; `docs/03-cors-and-rate-limiting.md`) -- tighter on
-`/marketing/*` than everything else, and not a real per-user limiter (there's only one
-caller, the backend).
+`Retry-After` past the ceiling; `docs/03-cors-and-rate-limiting.md`) and not a real
+per-user limiter (there's only one caller, the backend).
 
 Core: `GET /health`, `GET /model/status`, `POST /data/ingest`
 Forecasting: `POST /forecast/daily`, `/forecast/weekly`, `/forecast/daily-batch`
   (all items, 1 call, ~6× faster), `/forecast/weekly-batch`, `/forecast/seasonality-adjustment`
-Alerts/surplus/marketing: `POST /alerts/waste-prevention`, `/surplus/detect`,
-  `/marketing/generate-offer`, `/marketing/publish` (dry-run by default)
+Alerts/surplus: `POST /alerts/waste-prevention`, `/surplus/detect`,
+  `POST /catalogue/upsert` (registers/refreshes a product's economics)
 **RestoMind bridge:** `POST /integration/restomind/production-plan` (Admin screen),
   `/integration/restomind/surplus-offers` (Stores screen),
   `/integration/restomind/predict` (weekly, maps to their `predictions` collection — routes

@@ -127,7 +127,7 @@ POST {AI_SERVICE_URL}/integration/restomind/surplus-offers
   ]
 }
 ```
-**Response:** `{ itemsAtRisk:[{ productId, projectedSurplus, riskScore, suggestedDiscountPct, offerCopyAr, newPrice }] }`
+**Response:** `{ itemsAtRisk:[{ productId, projectedSurplus, riskScore, suggestedDiscountPct }] }`
 
 ### 3.4 إدخال مبيعات — عشان الموديل يتعلّم المستوى الحقيقي
 

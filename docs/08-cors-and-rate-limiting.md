@@ -48,30 +48,22 @@ neighbor, and no tiers to enforce. If this service had a genuine per-user rate l
 it would need per-user identity, which it deliberately does NOT have (`docs/01` §2.1 /
 §7 — per-tenant credentials are explicitly out of scope).
 
-What actually matters: this service does real compute and calls real paid third-party
-APIs on every request —
+What actually matters: this service does real compute on every request —
 
 - `/forecast/*`, `/surplus/detect`, `/integration/restomind/*` — model inference (CPU),
   cheap per-call but not free at volume.
-- `/marketing/generate-offer` — calls an external LLM (`LLM_API_KEY`, `app/marketing/copy.py`)
-  when configured. **Billed per call.**
-- `/marketing/publish` with `dry_run=false` — calls the Meta Graph API and posts to a
-  real public page. Not a metered $ cost the same way, but a real-world side effect that
-  spamming would be actively harmful, not just expensive.
 
 If the backend has a bug (a retry loop with no backoff, a cron misfire calling this in a
 tight loop, a queue replaying the same job thousands of times) or its own API key leaks
 and gets abused, this service has **no ceiling today** — it will happily accept and
-execute every request, running up the GCP compute bill and/or the LLM bill and/or
-spamming a real Facebook page, as fast as the caller can send requests. That's the
-failure mode this plan protects against: **not** "is this fair to users," but **"can one
-malfunctioning or compromised caller run up an unbounded bill or do unbounded real-world
-damage before a human notices and intervenes."**
+execute every request, running up the GCP compute bill, as fast as the caller can send
+requests. That's the failure mode this plan protects against: **not** "is this fair to
+users," but **"can one malfunctioning or compromised caller run up an unbounded bill
+before a human notices and intervenes."**
 
 This reframing matters for every design choice below: the limit should be set generously
 above realistic peak legitimate traffic (so it never gets in the way of normal
-operation) and tightest on the routes that cost real money per call, not evenly spread
-across all routes as if fairness were the goal.
+operation).
 
 ---
 
@@ -144,12 +136,6 @@ actually needed.
     `/forecast/daily-batch` exist specifically so the backend does NOT need to call
     per-item in a loop — see `app/api/main.py`'s docstring there — so per-minute call
     volume should stay low even under real load).
-  - **Cost-sensitive routes (`/marketing/generate-offer`, `/marketing/publish`):** much
-    tighter, e.g. 20 requests/minute. These are the ones with a real per-call $ cost or
-    real-world side effect (§1.2) — this is the limit that actually matters for the
-    "don't blow up the bill" goal. Size it against realistic legitimate usage (how many
-    offers would a real bakery actually generate/publish per minute? almost certainly
-    not more than a handful) rather than against `/forecast/*` traffic patterns.
 - **On exceeding the limit:** `429 Too Many Requests`, using the same `ErrorResponse`
   shape as the API-key guard (`schemas.ErrorResponse`, matching the pattern already
   established in `docs/01` §4 step 2) so error handling stays consistent. Include a
@@ -192,8 +178,7 @@ will have moved on by the time this is picked up.
    also count toward the limit as a brute-force guard — pick one and say why in the
    commit). Key the counter off `request.headers.get("X-API-Key", request.client.host)`
    so it degrades to per-IP in dev mode where no key is required.
-   Path-match `/marketing/generate-offer` and `/marketing/publish` for the tighter tier;
-   everything else (except `/health`) gets the default tier.
+   Everything else (except `/health`) gets the default tier.
 4. **Concurrency note:** `dict` mutation from an async middleware running in a single
    `uvicorn` worker is safe without extra locking (no `await` between read-increment-write
    if written carefully) — don't add threading primitives that aren't needed for a
@@ -208,7 +193,6 @@ will have moved on by the time this is picked up.
 
 - Extend `tests/test_api.py` (or a new `tests/test_ratelimit.py` if it's cleaner) with:
   - N+1 requests to a default-tier route within the window → the (N+1)th gets 429.
-  - The same for the tighter marketing tier, with its own lower N.
   - A request to `/health` past any limit → still 200 (stays exempt).
   - A 429 response includes `Retry-After`.
   - After the window elapses (mock/advance time rather than sleeping in a test — inject

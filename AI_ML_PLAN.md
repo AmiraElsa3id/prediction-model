@@ -144,9 +144,6 @@ trust the number, and it demos far better than a bare integer.
 - `POST /alerts/waste-prevention` → manual qty vs forecast interval → severity + projected EGP loss
 - `POST /surplus/detect` → risk score from remaining stock, hours to close, expected sell-through,
   and the configurable shelf-life table
-- `POST /marketing/generate-offer` → Egyptian Arabic copy + discount tier + validity window
-- `POST /marketing/publish` → **mocked by default** (returns a rendered post preview); real Meta
-  Graph API call behind a flag
 - `GET /health`
 
 **Discount sizing is rule-based tiers by risk score** — price elasticity cannot be learned without

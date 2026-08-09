@@ -29,7 +29,6 @@ from app.core.features import build_features
 from app.core.generate import generate
 from app.core.items import BY_SKU, CATALOGUE
 from app.core.surplus import detect_surplus
-from app.marketing.copy import OfferService
 from app.models.forecaster import CalendarDecomposed, MovingAverage, SeasonalNaive
 from app.models.service import ForecastService
 
@@ -65,7 +64,7 @@ def sku_label(sku: str) -> str:
 # --------------------------------------------------------------------------------------
 
 st.title("🥐 Bakery Demand & Surplus AI")
-st.caption("Demand forecasting and automated surplus marketing for Egyptian bakeries")
+st.caption("Demand forecasting and automated surplus detection for Egyptian bakeries")
 
 st.warning(
     "**All figures below are SIMULATED.** The bakery is pre-launch, so the system is "
@@ -241,17 +240,17 @@ with tab3:
     else:
         c2.write(f"**{len(surplus)} item(s) at risk** · "
                  f"total value at risk: **{sum(s.value_at_risk_egp for s in surplus):,.0f} EGP**")
-        offers = OfferService(seed=7)
         for s in surplus:
             with c2.container(border=True):
                 cc1, cc2 = st.columns([1, 2])
                 cc1.metric(BY_SKU[s.sku].name_ar, f"{s.current_stock} left",
                            delta=f"{s.suggested_discount_pct}% off", delta_color="off")
                 cc1.caption(f"Urgency: {s.urgency} · {s.value_at_risk_egp:,.0f} EGP at risk")
-                offer = offers.build(s.sku, s.suggested_discount_pct)
-                cc2.markdown(f"#### 📣 {offer.copy_ar}")
-                cc2.caption(f"{offer.old_price:.0f} → {offer.new_price:.0f} EGP · "
-                            f"copy by: {offer.generator} · {' '.join(offer.hashtags)}")
+                cc2.markdown(f"##### {BY_SKU[s.sku].name_ar}")
+                cc2.caption(
+                    f"{s.expected_remaining_sales:.0f} expected sales left tonight · "
+                    f"suggested discount {s.suggested_discount_pct}%"
+                )
 
 
 # --------------------------------------------------------------------------------------

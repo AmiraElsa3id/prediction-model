@@ -279,61 +279,6 @@ class SurplusResponse(BaseModel):
     total_value_at_risk_egp: float
 
 
-# -- marketing -----------------------------------------------------------------------
-
-
-class OfferRequest(SKUMixin):
-    sku: str = Field(..., examples=["CAKE_GATEAU"])
-    discount_pct: int = Field(..., ge=5, le=70, description="Discount percentage")
-    close_time: str = Field("10 بالليل", description="Human-readable offer deadline")
-
-
-class OfferResponse(BaseModel):
-    sku: str
-    item_name_ar: str
-    discount_pct: int
-    old_price: float
-    new_price: float
-    copy_ar: str = Field(..., description="Promotional copy in Egyptian Arabic")
-    valid_until: str
-    generator: str = Field(..., description="'llm' or 'template' -- which produced the copy")
-    hashtags: list[str]
-
-
-class PublishRequest(BaseModel):
-    sku: str
-    copy_ar: str = Field(..., description="Copy to publish")
-    platforms: list[str] = Field(
-        default_factory=lambda: ["facebook"],
-        description="Target platforms: 'facebook' and/or 'instagram'",
-    )
-    dry_run: bool = Field(
-        True,
-        description=(
-            "When true (default) returns a preview without contacting Meta. "
-            "Live publishing posts to a real public page and requires explicit opt-in."
-        ),
-    )
-
-    @field_validator("platforms")
-    @classmethod
-    def _known_platforms(cls, v: list[str]) -> list[str]:
-        allowed = {"facebook", "instagram"}
-        bad = set(v) - allowed
-        if bad:
-            raise ValueError(f"unsupported platforms: {', '.join(sorted(bad))}")
-        return v
-
-
-class PublishResponse(BaseModel):
-    status: str = Field(..., description="'preview' | 'published' | 'failed'")
-    dry_run: bool
-    platforms: list[str]
-    preview: dict = Field(default_factory=dict, description="Rendered post per platform")
-    post_ids: dict = Field(default_factory=dict, description="Live post IDs, when published")
-    message: str
-
-
 # -- RestoMind integration bridge ----------------------------------------------------
 
 
@@ -428,8 +373,6 @@ class RMSurplusItem(BaseModel):
     urgency: str
     hoursToClose: float
     suggestedDiscountPct: int
-    offerCopyAr: str | None = None
-    newPrice: float | None = None
 
 
 class RMSurplusResponse(BaseModel):

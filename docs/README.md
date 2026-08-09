@@ -50,9 +50,9 @@ docs/
 - **Root `AI_ML_PLAN.md`** — original project plan
 - **Root `postman_collection.json`** — 12 API endpoints with auto-tests
 - **Root `problem_analysis.html`** — problem-size pitch (Arabic)
-- **`app/` folder** — source code (core, models, marketing, integration, api)
+- **`app/` folder** — source code (core, models, integration, api)
 - **`scripts/` folder** — backtest, simulation, dashboard
-- **`tests/` folder** — 119 unit & integration tests
+- **`tests/` folder** — 113 unit & integration tests
 
 ---
 

@@ -1,7 +1,7 @@
 """Bakery item catalogue: economics, shelf life, and demand behaviour.
 
 Single source of truth, shared by the synthetic generator, the forecaster's
-newsvendor quantile, and the surplus/marketing endpoints.
+newsvendor quantile, and the surplus-detection endpoints.
 
 The prices and costs here are *plausible Egyptian bakery figures, not measured ones*.
 They set the newsvendor service level q*, so when real unit economics arrive they

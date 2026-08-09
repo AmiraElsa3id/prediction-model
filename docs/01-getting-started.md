@@ -108,9 +108,6 @@ model/
 │   │   ├── seasonality.py        ← تأثيرات التقويم (Ridge) — قلب الميزة المصرية
 │   │   ├── forecaster.py         ← الموديل الإنتاجي CalendarDecomposed + الأساس seasonal-naive
 │   │   └── service.py            ← بوابة حد التدريب (قبل 90 يوم مفيش توقّع) + ingestion
-│   ├── marketing/                ← تسويق الفائض
-│   │   ├── copy.py               ← كتابة الإعلان بالعامية (LLM + قوالب احتياطية)
-│   │   └── publisher.py          ← النشر على فيسبوك/انستجرام (معاينة افتراضيًا)
 │   ├── integration/              ← ⭐ الربط مع RestoMind
 │   │   ├── restomind.py          ← الجسر: بيحوّل شكل داتاهم لمخرجات الموديل
 │   │   ├── registry.py           ← حالة كل مطعم لوحده (multi-tenant) + تعلّم المستوى
@@ -160,7 +157,6 @@ model/
 | forecasting | `POST /forecast/seasonality-adjustment` | أثر المناسبات على يوم |
 | alerts | `POST /alerts/waste-prevention` | تحذير هدر |
 | surplus | `POST /surplus/detect` | كشف الفائض |
-| marketing | `POST /marketing/generate-offer` · `/publish` | إعلان عربي + نشر |
 | **restomind** | `POST /integration/restomind/production-plan` | خطة إنتاج (شاشة الأدمن) |
 | **restomind** | `POST /integration/restomind/surplus-offers` | فائض + عروض (شاشة الستورز) |
 | **restomind** | `POST /integration/restomind/predict` | توقّع أسبوعي (لمجموعة predictions) |

@@ -1,8 +1,8 @@
 # Bakery Demand & Surplus AI — POC
 
-An AI layer for Egyptian bakeries: forecast production to cut waste, and automatically
-market end-of-day surplus. Built as a **proof of concept for stakeholders**, on top of an
-existing e-commerce/POS system.
+An AI layer for Egyptian bakeries: forecast production to cut waste and detect surplus
+that needs quick discounting. Built as a **proof of concept for stakeholders**, on top of
+an existing e-commerce/POS system.
 
 > ### ⚠️ All results here are SIMULATED
 > The bakery is pre-launch, so there is no real sales history yet, and no public dataset
@@ -25,8 +25,6 @@ existing e-commerce/POS system.
 | Calendar effect for a date (Ramadan/Eid/…), with attribution | `POST /forecast/seasonality-adjustment` |
 | Warn when a manual production entry will cause waste | `POST /alerts/waste-prevention` |
 | Detect stagnant stock near closing and size a discount | `POST /surplus/detect` |
-| Write Egyptian-Arabic promo copy | `POST /marketing/generate-offer` |
-| Publish to Facebook/Instagram (dry-run by default) | `POST /marketing/publish` |
 | **Post end-of-day actuals so the model learns** | `POST /data/ingest` |
 | **Per-item status: untrained vs trained model** | `GET /model/status` |
 
@@ -91,7 +89,7 @@ data and nothing else:
 - The newsvendor quantile (how conservatively each item is forecast) is derived **per
   item from its own uploaded economics**, `q* = Cu/(Cu+Co)`, so a brand-new SKU gets a
   sane service level from day one.
-- `/model/status`, `/forecast/*`, `/alerts/*`, `/surplus/*` and `/marketing/*` all read
+- `/model/status`, `/forecast/*`, `/alerts/*`, `/surplus/*` all read
   the same per-service `Catalogue`, so an unknown SKU is a clear 404 with a hint, never
   a guess.
 
@@ -128,9 +126,6 @@ app/
 forecaster.py       SeasonalNaive, MovingAverage, LightGBMQuantile,
                         CalendarDecomposed (production)
     service.py          threshold-gated routing, ingestion, intervals, explanations — model layer
-  marketing/
-    copy.py             Egyptian-Arabic copy (LLM + template fallback, validated)
-    publisher.py        Meta Graph API client (dry-run by default)
   integration/
     restomind.py        bridge to RestoMind's field shapes; routes SKU-linked products
                         through the trained model, else a learned/owner basis level
@@ -144,9 +139,9 @@ scripts/
     run_backtest.py     model comparison
     run_simulation.py   the EGP-saved business simulation
 dashboard.py            Streamlit investor demo
-tests/                  119 tests: calendar dates, effect recovery, API, cold-start,
+tests/                  113 tests: calendar dates, effect recovery, API, cold-start,
                         integration bridge/registry/store, guards
-postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into Postman)
+postman_collection.json endpoints with Arabic docs + auto-tests (import into Postman)
 ```
 
 ## Run it
@@ -155,7 +150,7 @@ postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into 
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python -m app.core.generate      # regenerate the synthetic dataset
-.venv/bin/python -m pytest tests/ -q       # 119 tests
+.venv/bin/python -m pytest tests/ -q       # 113 tests
 .venv/bin/python -m scripts.run_backtest   # model comparison table
 .venv/bin/python -m scripts.run_simulation # the money slide
 
@@ -167,8 +162,6 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 | Variable | Purpose |
 |---|---|
-| `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | free-tier LLM for Arabic copy (Groq/Gemini/OpenRouter). Without it, templates are used. |
-| `META_PAGE_ID`, `META_ACCESS_TOKEN`, `META_PUBLISH_ENABLED` | live Meta publishing. All three required; otherwise `/marketing/publish` returns a preview. |
 | `COLD_START` | `true` starts with zero history (every item untrained, no forecast until it crosses the threshold) for the cold-start demo. Default trains on the full simulated dataset. |
 | `REQUIRE_API_KEY`, `API_KEY_HASH` | API key auth for every route except `/health` (see [docs/06-api-key-hardening.md](docs/06-api-key-hardening.md)). Unset in local dev, auth is skipped. `API_KEY_HASH` is the SHA-256 hex digest of the real key, not the key itself — the raw key lives only on the caller's side. Callers send it as `X-API-Key`. Rotation is manual only for now. |
 
@@ -176,8 +169,7 @@ No `CORS_ORIGINS`: this service is never called from a browser directly, only th
 backend calls it server-to-server, so there's no CORS layer to configure
 ([docs/08-cors-and-rate-limiting.md](docs/08-cors-and-rate-limiting.md) §2.1). Every route except `/health` also sits
 behind a blunt, always-on cost-guard rate limit (not a real per-user limiter — see
-[docs/08](docs/08-cors-and-rate-limiting.md) §1.2 for why); its thresholds are constants in `app/api/ratelimit.py`, tighter
-on `/marketing/*` than on the cheap forecast/surplus routes.
+[docs/08](docs/08-cors-and-rate-limiting.md) §1.2 for why); its thresholds are constants in `app/api/ratelimit.py`.
 
 ## What's needed to move beyond the POC
 

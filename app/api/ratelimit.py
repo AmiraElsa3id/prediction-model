@@ -4,10 +4,8 @@ Not a real per-user rate limiter -- there is exactly one legitimate caller (the
 backend, authenticated by the single shared API key from app.api.auth), so this can
 only ever see "the backend" as a caller, not individual end users. This exists purely
 to cap the worst case: a malfunctioning retry loop or a leaked key running up the GCP
-compute / LLM bill, or spamming a real Facebook page via /marketing/publish, before a
-human notices. Deliberately blunt: a fixed-window counter, no new dependency, tuned
-generously above realistic peak legitimate traffic -- tighter only on the routes with a
-real per-call $ cost.
+compute / LLM bill before a human notices. Deliberately blunt: a fixed-window counter,
+no new dependency, tuned generously above realistic peak legitimate traffic.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ def _int_env(name: str, fallback: int) -> int:
     return value if value > 0 else fallback
 
 
-# All three are overridable per-deploy (docs/03-cors-and-rate-limiting.md §2.2), but the
+# Both are overridable per-deploy (docs/03-cors-and-rate-limiting.md §2.2), but the
 # hardcoded values here are the actual safety net -- any unset/invalid env var falls
 # back to them rather than failing open with no limit at all.
 WINDOW_SECONDS = _int_env("RATE_LIMIT_WINDOW_SECONDS", 60)
@@ -41,25 +39,14 @@ WINDOW_SECONDS = _int_env("RATE_LIMIT_WINDOW_SECONDS", 60)
 # volume should stay well under this even at peak.
 DEFAULT_LIMIT_PER_MIN = _int_env("RATE_LIMIT_DEFAULT_PER_MIN", 300)
 
-# Tight: these routes have a real per-call cost (a billed LLM call) or a real-world side
-# effect (a live Facebook post), not just CPU. Sized against realistic bakery usage
-# (a handful of offers/publishes a minute, not hundreds), not against forecast traffic.
-MARKETING_LIMIT_PER_MIN = _int_env("RATE_LIMIT_MARKETING_PER_MIN", 20)
-MARKETING_PATHS = frozenset({"/marketing/generate-offer", "/marketing/publish"})
-
-# (caller, tier) -> (window_start_monotonic, count). Tracked per TIER, not one number
-# per caller for the whole service -- a single shared counter would let heavy but
-# legitimate /forecast/* traffic eat into the marketing budget and trip it early,
-# defeating the point of giving cost-sensitive routes their own tighter ceiling. One
-# process, one event loop: plain dict mutation is safe without locking since nothing
-# awaits between read and write here.
+# (caller, tier) -> (window_start_monotonic, count). One process, one event loop:
+# plain dict mutation is safe without locking since nothing awaits between read and
+# write here.
 _COUNTERS: dict[tuple[str, str], tuple[float, int]] = {}
 
 
 def _tier(path: str) -> tuple[str, int]:
     """Which bucket a route falls into, and that bucket's limit."""
-    if path in MARKETING_PATHS:
-        return "marketing", MARKETING_LIMIT_PER_MIN
     return "default", DEFAULT_LIMIT_PER_MIN
 
 
