@@ -25,6 +25,16 @@
       "key": "apiKey",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "restaurantId",
+      "value": "665f0a1b2c3d4e5f00000001",
+      "type": "string"
+    },
+    {
+      "key": "productId",
+      "value": "p1",
+      "type": "string"
     }
   ],
   "item": [
@@ -467,19 +477,20 @@
           }
         ],
         "url": {
-          "raw": "{{baseUrl}}/data/ingest",
+          "raw": "{{baseUrl}}/integration/restomind/ingest",
           "host": [
             "{{baseUrl}}"
           ],
           "path": [
-            "data",
+            "integration",
+            "restomind",
             "ingest"
           ]
         },
-        "description": "الباك بينده ده كل ليلة بمبيعات اليوم. لما صنف يوصل 90 يوم بيتحوّل تلقائيًا للموديل المدرَّب. `newly_switched_to_ml` بيقولك مين اتحوّل.",
+        "description": "بيستقبل مبيعات RestoMind الفعلية لكل مطعم ويحفظها في سجل المطعم. بعد عدد كفاية من الأيام العادية، التوقعات تستخدم مستوى الطلب المتعلّم بدل `avgDailySales`. ابعت `productionQty` و`closingStock` لما يكونوا متاحين عشان أيام نفاد المخزون ما تقللش تقدير الطلب بالغلط.",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"records\": [\n    {\"date\":\"2025-07-20\",\"sku\":\"BREAD_BALADI\",\"sales_qty\":1150,\"production_qty\":1300,\"closing_stock\":150},\n    {\"date\":\"2025-07-20\",\"sku\":\"CAKE_GATEAU\",\"sales_qty\":80,\"production_qty\":95,\"closing_stock\":15}\n  ]\n}"
+          "raw": "{\n  \"restaurantId\": \"{{restaurantId}}\",\n  \"records\": [\n    {\n      \"date\": \"2025-02-10\",\n      \"productId\": \"{{productId}}\",\n      \"salesQty\": 38,\n      \"productionQty\": 45,\n      \"closingStock\": 7\n    },\n    {\n      \"date\": \"2025-02-11\",\n      \"productId\": \"{{productId}}\",\n      \"salesQty\": 41,\n      \"productionQty\": 48,\n      \"closingStock\": 7\n    }\n  ],\n  \"products\": [\n    {\n      \"productId\": \"{{productId}}\",\n      \"title\": \"كنافة\",\n      \"category\": \"حلويات شرقية\",\n      \"price\": 45,\n      \"unitCost\": 20,\n      \"freshnessWindow\": 2,\n      \"avgDailySales\": 40\n    }\n  ]\n}"
         }
       },
       "event": [
@@ -488,9 +499,44 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test(\"200\",()=>pm.response.to.have.status(200));",
-              "let j=pm.response.json();",
-              "pm.test(\"اتسجّلت\",()=>pm.expect(j.rows_ingested).to.be.above(0));"
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"السجلات اتسجلت\", () => pm.expect(j.rowsIngested).to.eql(2));",
+              "pm.test(\"المنتج موجود في سجل المطعم\", () => pm.expect(j.daysByProduct).to.have.property(pm.collectionVariables.get(\"productId\")));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. RestoMind — حالة تعلّم المطعم",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/integration/restomind/status/{{restaurantId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "integration",
+            "restomind",
+            "status",
+            "{{restaurantId}}"
+          ]
+        },
+        "description": "بيرجّع تقدّم التعلّم لكل منتج في مطعم محدد: عدد الأيام المرصودة، هل المستوى جاي من المبيعات ولا تقدير المالك، وحدود الأيام اللي الخدمة بتستخدمها. استخدمه لعرض progress في الأدمن وبعد `/integration/restomind/ingest` للتحقق من التحديث."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
+              "let j = pm.response.json();",
+              "pm.test(\"نفس المطعم\", () => pm.expect(j.restaurantId).to.eql(pm.collectionVariables.get(\"restaurantId\")));",
+              "pm.test(\"فيه حدود تعلّم وقائمة منتجات\", () => { pm.expect(j.minDaysForLearned).to.be.above(0); pm.expect(j.items).to.be.an(\"array\"); });"
             ]
           }
         }
@@ -520,7 +566,7 @@
         "description": "جسر RestoMind — بياخد منتجاتكم بشكلها الحقيقي (productId, category, freshnessWindow) ويرجّع كمية الإنتاج لكل منتج. rule-based (cold-start) لحد ما تيجي داتا مبيعات.",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"date\":\"{{ramadanDate}}\",\n  \"products\":[\n    {\"productId\":\"p1\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"freshnessWindow\":2,\"avgDailySales\":180},\n    {\"productId\":\"p2\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"freshnessWindow\":2,\"avgDailySales\":40}\n  ]\n}"
+          "raw": "{\n  \"restaurantId\":\"{{restaurantId}}\",\n  \"date\":\"{{ramadanDate}}\",\n  \"products\":[\n    {\"productId\":\"{{productId}}\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"unitCost\":20,\"freshnessWindow\":2,\"avgDailySales\":40},\n    {\"productId\":\"p2\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"unitCost\":8,\"freshnessWindow\":2,\"avgDailySales\":180}\n  ]\n}"
         }
       },
       "event": [
@@ -562,7 +608,7 @@
         "description": "جسر RestoMind — المنتجات المعرّضة للهدر قرب القفل + خصم مقترح + إعلان بالعامية. جرّب الوقت 08:00 الصبح مش هيطلع حاجة.",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"timestamp\":\"{{ramadanDate}}T19:30:00\",\n  \"closeHour\":22,\n  \"stock\":[\n    {\"productId\":\"p1\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"freshnessWindow\":2,\"avgDailySales\":180,\"currentStock\":40},\n    {\"productId\":\"p2\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"freshnessWindow\":2,\"avgDailySales\":40,\"currentStock\":25}\n  ]\n}"
+          "raw": "{\n  \"restaurantId\":\"{{restaurantId}}\",\n  \"timestamp\":\"{{ramadanDate}}T19:30:00+02:00\",\n  \"closeHour\":22,\n  \"stock\":[\n    {\"productId\":\"{{productId}}\",\"title\":\"كنافة\",\"category\":\"حلويات شرقية\",\"price\":45,\"unitCost\":20,\"freshnessWindow\":2,\"avgDailySales\":40,\"currentStock\":25},\n    {\"productId\":\"p2\",\"title\":\"كرواسون\",\"category\":\"معجنات\",\"price\":18,\"unitCost\":8,\"freshnessWindow\":2,\"avgDailySales\":180,\"currentStock\":40}\n  ]\n}"
         }
       },
       "event": [
@@ -603,7 +649,7 @@
         "description": "بيطابق مجموعة `predictions` بتاعت RestoMind: بيرجّع `predictedOrders` أسبوعي + `featuresUsed` (بتتخزّن للمراجعة) + الأسباب. غيّر targetWeek ليوم عادي وشوف الرقم بيقل (رمضان بيرفع الكنافة).",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"restaurantId\":\"665f0a1b2c3d4e5f00000001\",\n  \"productId\":\"665f0a1b2c3d4e5f00000042\",\n  \"title\":\"كنافة\",\n  \"category\":\"حلويات شرقية\",\n  \"targetWeek\":\"2025-03-10\",\n  \"avgDailySales\":40\n}"
+          "raw": "{\n  \"restaurantId\":\"{{restaurantId}}\",\n  \"productId\":\"{{productId}}\",\n  \"title\":\"كنافة\",\n  \"category\":\"حلويات شرقية\",\n  \"targetWeek\":\"2025-03-10\",\n  \"avgDailySales\":40,\n  \"promotionActive\":false\n}"
         }
       },
       "event": [

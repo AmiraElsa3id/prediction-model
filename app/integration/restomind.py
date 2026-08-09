@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from app.core.egypt_calendar import CALENDAR
+from app.core.items import spoilage_severity_for_shelf_life
 from app.core.surplus import expected_sell_through
 from app.models.service import ModelNotReadyError
 
@@ -69,17 +70,41 @@ TRAINING_MESSAGE = (
 def _spoilage_severity(freshness_window_days: float | None) -> float:
     """Fraction of a leftover unit's value lost, from the product's freshness window.
 
-    Mirrors the catalogue's shelf-life tiers, but driven by RestoMind's own
-    `freshnessWindow` field instead of our hardcoded values.
+    Driven by RestoMind's own `freshnessWindow` field rather than the catalogue's
+    hardcoded shelf life; the tier table itself is shared with the catalogue via
+    `spoilage_severity_for_shelf_life` so the two definitions cannot drift apart.
     """
-    d = freshness_window_days or 1
-    if d <= 1:
-        return 1.0
-    if d <= 3:
+    return spoilage_severity_for_shelf_life(freshness_window_days)
+
+
+# Default goodwill lost on a stockout, as a multiple of margin, when a restaurant has
+# not told us its own figure. Mirrors `Item.stockout_goodwill_mult`'s default in
+# app/core/items.py -- neutral middle ground until real per-product economics exist.
+_DEFAULT_STOCKOUT_GOODWILL_MULT = 0.5
+
+
+def _newsvendor_quantile(
+    unit_cost: float | None, price: float, severity: float,
+) -> float | None:
+    """Profit-optimal service level q* = Cu / (Cu + Co), from REAL restaurant economics.
+
+    `None` when `unit_cost` is unknown -- the caller falls back to the fixed
+    INTERVAL_LOW/HIGH band rather than pretending to know a number it doesn't. This is
+    the same formula as `Item.newsvendor_quantile` (app/core/items.py), just fed from
+    a restaurant's own `unitCost`/`price`/`freshnessWindow` instead of the hardcoded
+    11-item catalogue -- replacing that placeholder is the whole point of asking
+    RestoMind for real unit economics.
+    """
+    if unit_cost is None or price <= 0:
+        return None
+    margin = price - unit_cost
+    if margin <= 0:
         return 0.5
-    if d <= 7:
-        return 0.25
-    return 0.15
+    cu = margin * (1.0 + _DEFAULT_STOCKOUT_GOODWILL_MULT)
+    co = unit_cost * severity
+    if cu + co <= 0:
+        return 0.5
+    return round(cu / (cu + co), 4)
 
 
 @dataclass
@@ -90,6 +115,7 @@ class ProductInput:
     title: str
     category: str | None = None
     price: float = 0.0
+    unit_cost: float | None = None          # EGP; RestoMind Product.unitCost, if known
     freshness_window: float | None = None   # days; RestoMind Product.freshnessWindow
     avg_daily_sales: float | None = None     # owner estimate; becomes the basis if no learned level
     sku: str | None = None                   # catalogue link; when present and trained, the
@@ -248,13 +274,25 @@ def production_plan(
                 "trainingMessage": TRAINING_MESSAGE,
             })
             continue
+
+        lower = max(base * BASIS_QUANTUM_LOW, 0)
+        upper = max(base * BASIS_QUANTUM_HIGH, 0)
+        # With real unit_cost + price, pick the profit-optimal point within the
+        # uncertainty band instead of always the raw point estimate: a thin-margin,
+        # short-shelf-life product (q* low) should be produced nearer the lower bound
+        # to avoid waste, a high-margin/long-shelf-life one (q* high) nearer the upper
+        # bound to avoid stockouts. Unknown economics keeps the old behaviour exactly
+        # (`q is None` -> the point estimate, same as before this existed).
+        severity = _spoilage_severity(p.freshness_window)
+        q = _newsvendor_quantile(p.unit_cost, p.price, severity)
+        recommended = base if q is None else lower + q * (upper - lower)
         out.append({
             "productId": p.product_id,
             "title": p.title,
             "date": target_date.isoformat(),
-            "recommendedQty": int(round(max(base, 0))),
-            "lowerBound": int(round(max(base * BASIS_QUANTUM_LOW, 0))),
-            "upperBound": int(round(base * BASIS_QUANTUM_HIGH)),
+            "recommendedQty": int(round(max(recommended, 0))),
+            "lowerBound": int(round(lower)),
+            "upperBound": int(round(upper)),
             "confidence": confidence,
             "source": mode,
             "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
@@ -448,9 +486,14 @@ def surplus_offers(
         if risk < 0.15 or projected_surplus < 1:
             continue
 
-        # Discount tiers by raw risk, floored to stay above marginal cost is not possible
-        # without cost -- so cap at a sane maximum instead.
+        # Discount tiers by raw risk, capped at a sane maximum.
         discount = 40 if raw_risk >= 0.8 else 30 if raw_risk >= 0.6 else 20 if raw_risk >= 0.4 else 10
+        # Floored to stay above marginal cost, now that real unit_cost lets us: selling
+        # below cost to avoid waste just trades one loss for a bigger one. Unknown cost
+        # keeps the old behaviour (cap-only, no floor).
+        if s.unit_cost is not None and s.price > 0:
+            max_discount_pct = max(0, int((1 - s.unit_cost / s.price) * 100))
+            discount = min(discount, max_discount_pct)
 
         results.append({
             "productId": s.product_id,

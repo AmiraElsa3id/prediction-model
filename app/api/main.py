@@ -475,8 +475,8 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
     products = [
         restomind.ProductInput(
             product_id=p.productId, title=p.title, category=p.category,
-            price=p.price, freshness_window=p.freshnessWindow,
             avg_daily_sales=p.avgDailySales, sku=p.sku,
+            price=p.price, unit_cost=p.unitCost, freshness_window=p.freshnessWindow,
             avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in req.products
@@ -520,7 +520,7 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
     stock = [
         restomind.StockInput(
             product_id=s.productId, title=s.title, category=s.category,
-            price=s.price, freshness_window=s.freshnessWindow,
+            price=s.price, unit_cost=s.unitCost, freshness_window=s.freshnessWindow,
             avg_daily_sales=s.avgDailySales, current_stock=s.currentStock,
             avg_daily_sales_window=_window(s.avgDailySalesWindow),
         )
@@ -534,7 +534,7 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
     registry.upsert_products(req.restaurantId, [
         restomind.ProductInput(
             product_id=s.product_id, title=s.title, category=s.category,
-            price=s.price, freshness_window=s.freshness_window,
+            price=s.price, unit_cost=s.unit_cost, freshness_window=s.freshness_window,
             avg_daily_sales=s.avg_daily_sales,
             avg_daily_sales_window=s.avg_daily_sales_window,
         )
@@ -607,7 +607,8 @@ def rm_ingest(req: schemas.RMIngestRequest) -> schemas.RMIngestResponse:
     products = [
         restomind.ProductInput(
             product_id=p.productId, title=p.title, category=p.category,
-            price=p.price, freshness_window=p.freshnessWindow, avg_daily_sales=p.avgDailySales,
+            price=p.price, unit_cost=p.unitCost, freshness_window=p.freshnessWindow,
+            avg_daily_sales=p.avgDailySales,
             avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in (req.products or [])

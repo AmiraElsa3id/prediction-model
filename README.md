@@ -142,7 +142,11 @@ dashboard.py            Streamlit investor demo
 tests/                  113 tests: calendar dates, effect recovery, API, cold-start,
                         integration bridge/registry/store, guards
 postman_collection.json endpoints with Arabic docs + auto-tests (import into Postman)
+ENDPOINT_FLOW.md        endpoint purpose, call order, side effects, and integration flows
 ```
+
+See [API endpoint flow](ENDPOINT_FLOW.md) for the recommended native and RestoMind call
+sequences, or import [the Postman collection](postman_collection.json) for runnable examples.
 
 ## Run it
 
