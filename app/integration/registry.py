@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -218,6 +221,11 @@ class JsonFileRegistryStore:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        # Serialises read-modify-write: FastAPI runs /predict in a threadpool, so two
+        # concurrent calls can otherwise both re-read the file, both re-write it (lost
+        # update), and one `os.replace` lands while the other thread still has the file
+        # open -- the Windows PermissionError this lock eliminates within a process.
+        self._lock = threading.Lock()
 
     def load_all(self) -> dict[str, dict]:
         if not self.path.exists():
@@ -233,13 +241,37 @@ class JsonFileRegistryStore:
         # No partial write is possible in a single JSON file: read the current whole
         # state, replace one restaurant's entry, write the whole thing back. This is
         # the write-amplification MongoRegistryStore exists to remove.
-        current = self.load_all()
-        current[restaurant_id] = doc
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic: a crash mid-write must not leave a truncated store behind.
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path)
+        with self._lock:
+            current = self.load_all()
+            current[restaurant_id] = doc
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic: a crash mid-write must not leave a truncated store behind.
+            # A unique temp name keeps concurrent writers (or a stale .tmp from a
+            # crashed process) from sharing one lock target.
+            tmp = self.path.with_name(
+                f"{self.path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+            )
+            try:
+                tmp.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+                self._replace_with_retry(tmp, self.path)
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _replace_with_retry(src: Path, dst: Path) -> None:
+        # os.replace on Windows raises PermissionError when `src` or `dst` is
+        # transiently held open (antivirus scan, a concurrent request's read).
+        # python's file is already closed and flushed here, so the lock clears in
+        # milliseconds; retry with a short backoff instead of failing the request.
+        for attempt in range(10):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
 
 
 class RestaurantRegistry:
