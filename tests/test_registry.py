@@ -349,20 +349,22 @@ def test_plan_reports_the_level_it_used(client):
 
 # -- P2: a measured mean carries its window's calendar and must be stripped -----------
 
+def test_owner_estimate_without_a_window_is_used_as_is(client):
+    """No window means "this is already an ordinary-day figure" -- do not adjust it."""
+    plan = client.post("/integration/restomind/production-plan", json={
+        "restaurantId": "DS_R2", "date": "2025-01-15",
+        "products": [{"productId": "DS_P2", "title": "فطير", "category": "معجنات",
+                      "avgDailySales": 77, "price": 30, "freshnessWindow": 2}],
+    }).json()
+    assert plan["items"][0]["baseDailyLevel"] == 77
 
-def test_ramadan_measured_mean_is_not_double_counted(client):
-    """A mean measured INSIDE Ramadan must not get the Ramadan multiplier again.
 
-    The caller's 14-day lookback is a raw mean over whatever days it covered. The
-    bridge multiplies `base` by the target day's calendar multiplier, so `base` has
-    to be an ordinary-day level. Feeding a Ramadan-inflated mean in as `base` applies
-    Ramadan twice -- over-forecast, over-produce, waste, in the exact season the
-    product exists to get right.
+def test_a_measured_window_is_no_longer_deseasonalised(client):
+    """The rule-based multipliers are gone, so a declared measurement window no longer
+    changes the plan (it is informational now, reported in the audit trail).
     """
     from app.core.egypt_calendar import CALENDAR
 
-    # Find a Ramadan day and a run of days around it, from the calendar itself
-    # rather than hardcoding a Hijri date.
     ramadan_day = next(
         d for d in (dt.date(2025, 3, 1) + dt.timedelta(days=i) for i in range(30))
         if CALENDAR.features(d)["is_ramadan"]
@@ -376,8 +378,6 @@ def test_ramadan_measured_mean_is_not_double_counted(client):
     body = {"restaurantId": "DS_R1", "date": ramadan_day.isoformat(),
             "products": [product]}
 
-    # Same number, once declared as a raw measurement over a Ramadan window and
-    # once as a plain ordinary-day estimate.
     without_window = client.post(
         "/integration/restomind/production-plan", json=body).json()
     with_window = client.post("/integration/restomind/production-plan", json={
@@ -392,41 +392,6 @@ def test_ramadan_measured_mean_is_not_double_counted(client):
 
     declared = with_window["items"][0]["recommendedQty"]
     undeclared = without_window["items"][0]["recommendedQty"]
-    assert declared < undeclared, (
-        "a Ramadan-measured mean was not deseasonalised, so Ramadan was applied twice"
+    assert declared == undeclared, (
+        "the removed rule layer must not make the declared window move the quantity"
     )
-
-
-def test_deseasonalise_is_a_noop_on_an_ordinary_window():
-    """A window of plain days must leave the mean essentially untouched."""
-    from app.integration.restomind import deseasonalise
-
-    # Mid-January 2025: no Ramadan, no Eid, no kahk season.
-    start, end = dt.date(2025, 1, 13), dt.date(2025, 1, 26)
-    out = deseasonalise(100.0, "حلويات شرقية", (start, end))
-    # Weekends still sit inside any two-week window, so allow a modest band --
-    # the point is that an ordinary window does not move the level much.
-    assert 80.0 < out < 125.0
-
-
-def test_deseasonalise_survives_a_reversed_or_degenerate_window():
-    from app.integration.restomind import deseasonalise
-
-    same_day = (dt.date(2025, 1, 15), dt.date(2025, 1, 15))
-    assert deseasonalise(50.0, "خبز", same_day) > 0
-
-    reversed_window = (dt.date(2025, 1, 26), dt.date(2025, 1, 13))
-    forward_window = (dt.date(2025, 1, 13), dt.date(2025, 1, 26))
-    assert deseasonalise(50.0, "خبز", reversed_window) == pytest.approx(
-        deseasonalise(50.0, "خبز", forward_window)
-    )
-
-
-def test_owner_estimate_without_a_window_is_used_as_is(client):
-    """No window means "this is already an ordinary-day figure" -- do not adjust it."""
-    plan = client.post("/integration/restomind/production-plan", json={
-        "restaurantId": "DS_R2", "date": "2025-01-15",
-        "products": [{"productId": "DS_P2", "title": "فطير", "category": "معجنات",
-                      "avgDailySales": 77, "price": 30, "freshnessWindow": 2}],
-    }).json()
-    assert plan["items"][0]["baseDailyLevel"] == 77

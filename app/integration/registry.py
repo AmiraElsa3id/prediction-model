@@ -2,20 +2,20 @@
 
 Answers the owner's question: *"if I seed sales data, does it change the model?"*
 
-The stateless bridge (`restomind.py`) forecasts every product purely from category priors
-+ the owner's `avgDailySales` estimate — so seeding a MENU changes what gets predicted, but
-not the numbers. This registry adds the missing piece: it stores each restaurant's sales
-history separately and **learns the real demand level per product from it**. Once a product
-has enough real days, its forecast uses the learned level instead of the owner's guess —
-so seeding sales now visibly moves the prediction.
+The stateless bridge (`restomind.py`) forecasts every product from the owner's
+`avgDailySales` estimate. This registry adds the missing piece: it stores each
+restaurant's sales history separately and **learns the real demand level per product
+from it**. Once a product has enough kept days, its forecast uses the learned level
+instead of the owner's guess — so seeding sales now visually moves the prediction.
 
-Scope of THIS layer: multi-tenant state + data-driven LEVEL (still rule-based for the
-calendar shape). Wiring the full trained `CalendarDecomposed` model per restaurant (which
-needs per-product economics generalised off the built-in catalogue) is the next step —
-tracked in HANDOFF.md §9.
+Scope of THIS layer: multi-tenant state + data-driven LEVEL. The rule-based calendar
+multipliers the bridge once applied are gone (`rule_based.py` and `market_priors.py`
+were removed; see `HANDOFF.md` §8). Wiring the full trained `CalendarDecomposed` model
+per restaurant (which needs per-product economics calibrated off the built-in
+catalogue) is the next step — tracked in `HANDOFF.md` §9.
 
 Persistence is pluggable (see `RegistryStore` in `mongo_store.py`): a JSON file
-(`JsonFileRegistryStore`, below -- the original mechanism, kept for local dev and the
+(`JsonFileRegistryStore`, the original mechanism, kept for local dev and the
 test suite) or MongoDB (`MongoRegistryStore` -- the durable option, one document per
 restaurant, immune to the JSON file's whole-corpus rewrite on every save). Which one is
 wired up is `app/api/main.py`'s decision; this module only knows the `RegistryStore`
@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from app.core.egypt_calendar import CALENDAR
-from app.integration.restomind import ProductInput, map_category, predict_week
+from app.integration.restomind import ProductInput, predict_week
 
 if TYPE_CHECKING:
     from app.integration.mongo_store import RegistryStore
@@ -143,13 +143,15 @@ class RestaurantState:
 
         Public because every endpoint that forecasts for a restaurant needs it, not
         just /predict. A `None` level means "no learned value, fall back to the
-        owner's estimate" — the caller decides, this only reports.
+        owner's estimate" — the caller decides, this only reports. `mode` is
+        `"training"` until the product has enough real days to earn a learned level,
+        then `"learned"`.
         """
         st = self.products.get(pid)
         if st is None or st.learned_level is None:
-            return None, "rule_based", "low"
+            return None, "training", "low"
         confidence = "medium" if st.observed_days >= CONFIDENT_DAYS else "low"
-        return st.learned_level, "rule_based_learned", confidence
+        return st.learned_level, "learned", confidence
 
     def levels_for(self, pids: Iterable[str]) -> dict[str, tuple[float | None, str, str]]:
         """`level_for` across many products, for the batch endpoints."""
