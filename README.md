@@ -27,7 +27,7 @@ existing e-commerce/POS system.
 | Write Egyptian-Arabic promo copy | `POST /marketing/generate-offer` |
 | Publish to Facebook/Instagram (dry-run by default) | `POST /marketing/publish` |
 | **Post end-of-day actuals so the model learns** | `POST /data/ingest` |
-| **Per-item mode: rule-based vs trained model** | `GET /model/status` |
+| **Per-item status: untrained vs trained model** | `GET /model/status` |
 
 ## Headline results (simulated, rolling-origin backtest)
 
@@ -50,24 +50,24 @@ existing e-commerce/POS system.
    and yields an *exact* explanation of every forecast. See
    [app/models/seasonality.py](app/models/seasonality.py) for the measurements behind this.
 
-## Cold start → trained model (hybrid)
+## Cold start → trained model
 
-A brand-new bakery has no history, so the system does **not** wait for data to be useful:
+A brand-new bakery has no history yet: until an item crosses the training threshold there
+is **no forecast at all** — the system is honest instead of handing the store a guess.
 
-- **Rule-based (day 0+):** each item forecasts from owner priors + hand-encoded Egyptian
-  calendar rules. It already knows croissants fall in Ramadan and kahk only sells before
-  Eid — no training required.
+- **Untrained (before 90 days):** `GET /model/status` reports the item `untrained`, and the
+  bridge endpoints answer with a `trainingMessage` ("still training") and `0` quantity when
+  there is no basis. No priors, no hand-encoded calendar rules are applied.
 - **Trained model (per item, at 90 days):** the backend posts each night's actuals to
   `POST /data/ingest`. Once an item reaches **90 days** of history it switches automatically
   to the trained `CalendarDecomposed` model. `GET /model/status` shows each item's mode and
   progress.
-- **Event-aware safety net:** even a "trained" item keeps using the rules for a major event
-  (Ramadan, Eid, kahk season, Sham El-Nessim) it has **not yet lived through** — so switching
-  to the model never makes a holiday forecast *worse*. It takes over that event only after it
-  has real data for it.
+- **Unseen-event confidence:** a major event (Ramadan, Eid, kahk season, Sham El-Nessim) the
+  model trained but has **not lived through** is still forecast — but flagged `low`
+  confidence with a wider interval, never silently upgraded.
 
 The 90-day threshold is configurable (`ForecastService(train_threshold=...)`). Start the
-service in cold-start mode with `COLD_START=true`.
+service with no history via `COLD_START=true`.
 
 ## Architecture
 
@@ -83,8 +83,7 @@ app/
   models/
     seasonality.py      per-item calendar multipliers (ridge, log space)
     forecaster.py       SeasonalNaive, LightGBMQuantile, CalendarDecomposed (production)
-    rule_based.py       cold-start forecaster: owner priors + calendar rules, no training
-    service.py          hybrid routing, ingestion, intervals, explanations — model layer
+    service.py          threshold-gated routing, ingestion, intervals, explanations — model layer
   marketing/
     copy.py             Egyptian-Arabic copy (LLM + template fallback, validated)
     publisher.py        Meta Graph API client (dry-run by default)
@@ -94,7 +93,7 @@ scripts/
     run_backtest.py     model comparison
     run_simulation.py   the EGP-saved business simulation
 dashboard.py            Streamlit investor demo
-tests/                  67 tests: calendar dates, effect recovery, API, cold-start, guards
+tests/                 107 tests: calendar dates, effect recovery, API, cold-start, guards
 postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into Postman)
 ```
 
@@ -104,7 +103,7 @@ postman_collection.json 12 endpoints with Arabic docs + auto-tests (import into 
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python -m app.core.generate      # regenerate the synthetic dataset
-.venv/bin/python -m pytest tests/ -q       # 57 tests
+.venv/bin/python -m pytest tests/ -q       # 107 tests
 .venv/bin/python -m scripts.run_backtest   # model comparison table
 .venv/bin/python -m scripts.run_simulation # the money slide
 
@@ -118,7 +117,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 |---|---|
 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | free-tier LLM for Arabic copy (Groq/Gemini/OpenRouter). Without it, templates are used. |
 | `META_PAGE_ID`, `META_ACCESS_TOKEN`, `META_PUBLISH_ENABLED` | live Meta publishing. All three required; otherwise `/marketing/publish` returns a preview. |
-| `COLD_START` | `true` starts with zero history (fully rule-based) for the cold-start demo. Default trains on the full simulated dataset. |
+| `COLD_START` | `true` starts with zero history (every item untrained, no forecast until it crosses the threshold) for the cold-start demo. Default trains on the full simulated dataset. |
 | `REQUIRE_API_KEY`, `API_KEY_HASH` | API key auth for every route except `/health` (see `docs/01-api-key-hardening.md`). Unset in local dev, auth is skipped. `API_KEY_HASH` is the SHA-256 hex digest of the real key, not the key itself — the raw key lives only on the caller's side. Callers send it as `X-API-Key`. Rotation is manual only for now. |
 
 No `CORS_ORIGINS`: this service is never called from a browser directly, only the
@@ -133,5 +132,5 @@ on `/marketing/*` than on the cheap forecast/surplus routes.
 The forecast is only as good as its inputs. Before a real deployment we need: confirmation
 the inventory schema exposes closing stock + stock-added per item/day; real shelf life and
 unit economics per item (these set `q*`); branch/SKU counts and opening hours; and
-eventually 12+ months of real POS history, at which point the cold-start priors hand over
-to the batch models.
+eventually 12+ months of real POS history, at which point cold-start items hand over to
+the trained models once they cross the training threshold.

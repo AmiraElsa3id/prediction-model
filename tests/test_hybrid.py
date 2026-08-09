@@ -1,8 +1,11 @@
-"""The cold-start -> trained-model transition, and event-aware routing.
+"""The cold-start -> trained-model transition after the rule layer was removed.
 
-This is the behaviour the user specifically asked for: rule-based until an item has
-enough history, then the trained model -- but never the model for a calendar event it
-has not yet lived through.
+This is the behaviour the user specifically asked for: below the training threshold an
+item has NO forecast (no rule-based fallback exists anymore, see HANDOFF.md §8). Once it
+has enough history its own trained model serves it. While the model is present but a
+major calendar event was never in the training window, the model still forecasts -- it
+just marks the day `low` confidence and widens the interval, because there is no rule
+path to route to anymore.
 """
 
 import datetime as dt
@@ -11,7 +14,7 @@ import pandas as pd
 import pytest
 
 from app.core.generate import generate
-from app.models.service import ForecastService
+from app.models.service import ForecastService, ModelNotReadyError
 
 RAMADAN_DAY = dt.date(2025, 3, 15)
 NORMAL_DAY = dt.date(2024, 10, 15)
@@ -24,55 +27,72 @@ def full():
     return df
 
 
-def test_cold_start_is_entirely_rule_based():
+def test_cold_start_has_no_forecast_at_all():
     svc = ForecastService(train_threshold=90).start_cold()
     st = svc.status()
-    assert st["items_rule_based"] == len(st["items"])
+    assert st["items_untrained"] == len(st["items"])
     assert st["items_trained"] == 0
-    # It still returns a usable forecast with no data at all.
-    r = svc.forecast("PASTRY_CROISSANT", NORMAL_DAY)
-    assert r.source == "rule_based"
-    assert r.quantity > 0
-
-
-def test_rule_based_knows_ramadan_without_any_data():
-    svc = ForecastService(train_threshold=90).start_cold()
-    normal = svc.forecast("PASTRY_CROISSANT", NORMAL_DAY).quantity
-    ramadan = svc.forecast("PASTRY_CROISSANT", RAMADAN_DAY).quantity
-    assert ramadan < normal  # croissants fall in Ramadan, from rules alone
+    # With the rules gone there is NO forecast, not a guessed number.
+    with pytest.raises(ModelNotReadyError):
+        svc.forecast("PASTRY_CROISSANT", NORMAL_DAY)
 
 
 def test_item_switches_to_model_after_threshold(full):
     d0 = full["date"].min()
     svc = ForecastService(train_threshold=90).start_cold()
-    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120)])
-    # A normal day (an event-type the window contained) uses the model.
+    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120) + pd.Timedelta(hours=1)])
+    # A normal day uses the model.
     assert svc.forecast("PASTRY_CROISSANT", NORMAL_DAY).source == "batch"
 
 
-def test_model_defers_to_rules_for_unseen_event(full):
-    """The key safety net: 120 days without a Ramadan must NOT forecast Ramadan by model."""
+def test_unseen_event_stays_on_model_with_low_confidence(full):
+    """120 days without a Ramadan must not invent a rule-based Ramadan forecast.
+
+    The model still forecasting the date, but marks it low-confidence and widens the
+    interval -- there is no rule layer left to hand the task to.
+    """
     d0 = full["date"].min()  # 2023-07-01; +120d has no Ramadan
     svc = ForecastService(train_threshold=90).start_cold()
-    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120)])
+    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120) + pd.Timedelta(hours=1)])
     assert "is_ramadan" not in svc.observed_events
-    # Item is trained, but the Ramadan day still routes to the rules.
-    assert svc.forecast("PASTRY_CROISSANT", RAMADAN_DAY).source == "rule_based"
-    # ...while an ordinary day uses the model.
-    assert svc.forecast("PASTRY_CROISSANT", NORMAL_DAY).source == "batch"
+    # Both dates now run through the model...
+    ramadan = svc.forecast("PASTRY_CROISSANT", RAMADAN_DAY)
+    normal = svc.forecast("PASTRY_CROISSANT", NORMAL_DAY)
+    assert ramadan.source == "batch"
+    assert normal.source == "batch"
+    # ...but the unseen-event day is flagged with low confidence.
+    assert ramadan.confidence == "low"
+    assert normal.confidence == "medium"
 
 
 def test_model_takes_over_event_once_seen(full):
     d0 = full["date"].min()
     svc = ForecastService(train_threshold=90).start_cold()
-    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=400)])  # includes Ramadan 2024
+    svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=400)])
     assert "is_ramadan" in svc.observed_events
-    assert svc.forecast("PASTRY_CROISSANT", RAMADAN_DAY).source == "batch"
+    r = svc.forecast("PASTRY_CROISSANT", RAMADAN_DAY)
+    assert r.source == "batch"
+    assert r.confidence == "high"   # the model has now trained through a Ramadan
 
 
 def test_ingest_reports_transitions(full):
     d0 = full["date"].min()
     svc = ForecastService(train_threshold=90).start_cold()
-    out = svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120)])
+    out = svc.ingest(full[full["date"] < d0 + pd.Timedelta(days=120) + pd.Timedelta(hours=1)])
     assert out["model_retrained"] is True
     assert len(out["newly_switched_to_ml"]) == full["sku"].nunique()
+
+
+def test_forecast_all_raises_model_not_ready_while_training():
+    svc = ForecastService(train_threshold=90).start_cold()
+    with pytest.raises(ModelNotReadyError):
+        svc.forecast_all(NORMAL_DAY, ["PASTRY_CROISSANT"])
+
+
+def test_status_reports_progress_towards_trained():
+    """status() keeps driving a per-item progress bar, now toward 'trained'."""
+    svc = ForecastService(train_threshold=90).start_cold()
+    item = svc.status()["items"][0]
+    assert item["mode"] == "untrained"
+    assert item["progress"] == 0.0
+    assert item["days_until_switch"] == 90

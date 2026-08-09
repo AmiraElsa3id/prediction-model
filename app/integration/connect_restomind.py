@@ -62,8 +62,12 @@ def _predict_trained(model_url, rid, product, sku, target_week) -> dict:
     }
 
 
-def _predict_rule_based(model_url, rid, product, category, target_week) -> dict:
-    """Cold-start weekly prediction from the rule-based bridge."""
+def _predict_no_sku(model_url, rid, product, category, target_week) -> dict:
+    """Prediction via the bridge for a product with no trained SKU link.
+
+    The bridge reports the owner-estimated or learned level; a product with neither
+    comes back flagged as still training rather than given a guessed number.
+    """
     r = httpx.post(f"{model_url}/integration/restomind/predict",
                    json={"restaurantId": rid, "productId": str(product["_id"]),
                          "title": product["title"], "category": category,
@@ -88,9 +92,9 @@ def run(target_week: dt.date, mongo_url: str = MONGO_URL, model_url: str = MODEL
                 # decomposed, Ramadan/Eid-aware) via the weekly forecast endpoint.
                 pred = _predict_trained(model_url, rid, p, sku, target_week)
             else:
-                # No trained SKU -> cold-start rule-based bridge (category priors).
-                pred = _predict_rule_based(model_url, rid, p, _category_name(db, p.get("category")),
-                                           target_week)
+                # No trained SKU -> bridge (owner estimate or learned level).
+                pred = _predict_no_sku(model_url, rid, p, _category_name(db, p.get("category")),
+                                       target_week)
 
             # Write into their predictions collection, in their document shape.
             doc = {

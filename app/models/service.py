@@ -24,15 +24,24 @@ from app.core.features import build_features
 from app.core.generate import generate
 from app.core.items import BY_SKU, Item
 from app.models.forecaster import CalendarDecomposed
-from app.models.rule_based import RuleBasedForecaster
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
 LOW_Q, HIGH_Q = 0.1, 0.9
 
-# Days of history an item needs before we trust the trained model over the rules.
-# Below this the forecast is rule-based (owner priors + calendar rules); at or above it,
-# the item switches to the trained CalendarDecomposed model. Confirmed with the user.
+# Days of history an item needs before its trained model is trusted. Below this there
+# is NO forecast: the rule-based cold-start layer was removed (see HANDOFF.md), so an
+# item under the threshold has no forecaster at all until it accumulates the data.
 TRAIN_THRESHOLD_DAYS = 90
+
+
+class ModelNotReadyError(RuntimeError):
+    """Raised when a forecast is requested for an item with no trained model yet.
+
+    This is the post-rule cold-start contract: below ``TRAIN_THRESHOLD_DAYS`` the model
+    admits it has nothing to say rather than inventing a number from hand-written
+    priors. The API maps this to a "still training" response; consumers fall back to
+    their own estimator until the item's own model exists.
+    """
 
 
 @dataclass
@@ -53,11 +62,12 @@ class ForecastService:
     def __init__(self, horizon: int = 1, train_threshold: int = TRAIN_THRESHOLD_DAYS) -> None:
         self.horizon = horizon
         self.train_threshold = train_threshold
-        # ML models start empty: a fresh bakery is entirely rule-based until data arrives.
+        # ML models start empty. Without the rule-based layer there is no afternoon
+        # fallback: an item only has a forecast once its model exists and is over the
+        # training threshold.
         self.point_model: CalendarDecomposed | None = None
         self.low_model: CalendarDecomposed | None = None
         self.high_model: CalendarDecomposed | None = None
-        self.rule_model = RuleBasedForecaster()
         self.history: pd.DataFrame | None = None
         self.features: pd.DataFrame | None = None
         self.observed_days: dict[str, int] = {}
@@ -66,9 +76,10 @@ class ForecastService:
 
     # -- data & training ----------------------------------------------------------
 
-    # Major calendar events. The trained model may only be trusted for one of these once
-    # it has actually appeared in the training window -- otherwise its learned effect is
-    # ~zero and it would forecast a Ramadan day as if it were ordinary.
+    # Major calendar events the trained model may still be weak on until it has seen
+    # them in its training window. When a date carries one it has never observed, the
+    # forecast is still made from the model, but the interval widens and confidence
+    # drops -- there is no rule layer left to route to instead.
     MAJOR_EVENTS = [
         "is_ramadan", "is_eid_fitr", "is_eid_adha", "is_kahk_window", "is_sham_el_nessim",
     ]
@@ -96,9 +107,9 @@ class ForecastService:
     def _fit_ml(self) -> None:
         """(Re)fit the trained model on all accumulated history.
 
-        Only called when at least one item has crossed the threshold. Items still under
-        it keep using the rules even after this runs -- routing is per item, in
-        :meth:`_use_ml`.
+        Called when at least one item has crossed the threshold. Items still under it
+        keep having no forecast -- routing is per item, in :meth:`_use_ml`, and the
+        rule-based fallback no longer exists.
         """
         self.features = build_features(self.history, horizon=self.horizon)
         self.point_model = CalendarDecomposed(horizon=self.horizon).fit(self.features)
@@ -111,13 +122,12 @@ class ForecastService:
 
         With the default full synthetic dataset every item has years of history, so all
         of them route to the trained `CalendarDecomposed` model. With a small slice (or
-        nothing), items below the threshold stay rule-based -- this is the cold-start
-        path a real new bakery follows.
+        nothing), items below the threshold have NO forecast -- this is the cold-start
+        path a real new bakery follows until its data arrives.
         """
         raw = generate() if raw is None else raw
         self.history = raw.copy()
         self._recount_days()
-        self.rule_model.update_baseline(self.history)
 
         # Fit the ML model only if some item has enough history to justify it.
         if self.observed_days and max(self.observed_days.values()) >= self.train_threshold:
@@ -125,7 +135,7 @@ class ForecastService:
         return self
 
     def start_cold(self) -> "ForecastService":
-        """Begin with zero history: every item is rule-based until data is ingested."""
+        """Begin with zero history: no model, so nothing is forecastable yet."""
         self.history = None
         self.features = None
         self.observed_days = {}
@@ -136,9 +146,8 @@ class ForecastService:
     def ingest(self, records: pd.DataFrame) -> dict:
         """Append end-of-day actuals and retrain if an item crosses the threshold.
 
-        This is what the POS/e-commerce backend calls each night. It accumulates real
-        sales, refreshes the rule-based baselines immediately, and promotes items to the
-        trained model once they reach `train_threshold` days.
+        This is what the API calls each night. It accumulates real sales, refreshes the
+        trained model whenever an item reaches `train_threshold` days.
         """
         records = records.copy()
         records["date"] = pd.to_datetime(records["date"])
@@ -148,7 +157,6 @@ class ForecastService:
 
         before = {s for s, n in self.observed_days.items() if n >= self.train_threshold}
         self._recount_days()
-        self.rule_model.update_baseline(self.history)
         after = {s for s, n in self.observed_days.items() if n >= self.train_threshold}
 
         newly_ready = sorted(after - before)
@@ -163,25 +171,24 @@ class ForecastService:
             "model_retrained": bool(after and (newly_ready or self.point_model is not None)),
         }
 
-    def _use_ml(self, sku: str, target_date: dt.date | None = None) -> bool:
-        """Route to the trained model for this item (and, if given, this date).
+    def _use_ml(self, sku: str) -> bool:
+        """Whether this item has a trained model it can serve a forecast for.
 
-        Two conditions, both required:
-          * the item has at least `train_threshold` days of history, and
-          * if a date is given, it carries no major calendar event the model has never
-            trained on -- otherwise the rules, which know that event, are safer.
+        The gate that used to be "rule-based below, trained above" is now simply "not
+        below": no model exists and no rules exist, so anything under the threshold is
+        simply not forecastable. An unseen-event date no longer routes away from the
+        model — see `_confidence_for_date` for how that case is handled instead.
         """
         if self.point_model is None or self.observed_days.get(sku, 0) < self.train_threshold:
-            return False
-        if target_date is not None and self._target_unseen_event(target_date):
             return False
         return True
 
     def status(self) -> dict:
-        """Per-item mode report: which items are rule-based vs trained, and how close.
+        """Per-item mode report: which items have a trained model, and how close to one.
 
-        Lets the frontend show a progress bar per item ("42 / 90 days until the AI takes
-        over") -- the cold-start story made visible.
+        Lets the frontend show a progress bar per item ("42 / 90 days"): before the
+        threshold an item is not forecastable at all (no rule layer remains); at or
+        above it the trained model serves it.
         """
         items = []
         for sku in BY_SKU:
@@ -189,7 +196,7 @@ class ForecastService:
             ml = self._use_ml(sku)
             items.append({
                 "sku": sku,
-                "mode": "trained_model" if ml else "rule_based",
+                "mode": "trained_model" if ml else "untrained",
                 "observed_days": days,
                 "days_until_switch": max(0, self.train_threshold - days) if not ml else 0,
                 "progress": round(min(1.0, days / self.train_threshold), 3),
@@ -197,7 +204,7 @@ class ForecastService:
         return {
             "train_threshold_days": self.train_threshold,
             "model_trained_at": self.trained_at.isoformat() if self.trained_at else None,
-            "items_rule_based": sum(1 for i in items if i["mode"] == "rule_based"),
+            "items_untrained": sum(1 for i in items if i["mode"] == "untrained"),
             "items_trained": sum(1 for i in items if i["mode"] == "trained_model"),
             "items": items,
         }
@@ -269,29 +276,31 @@ class ForecastService:
             return "medium"
         return "low"
 
-    def _rule_forecast(self, sku: str, target_date: dt.date) -> ForecastResult:
-        """Cold-start path: owner priors + calendar rules, no trained model involved."""
-        out = self.rule_model.forecast(sku, target_date)
-        return ForecastResult(
-            sku=sku,
-            date=target_date,
-            quantity=out["quantity"],
-            lower=out["lower"],
-            upper=out["upper"],
-            confidence="low",
-            source="rule_based",
-            factors=out["factors"],
-        )
+    def _confidence_for_date(self, sku: str, target_date: dt.date) -> tuple[str, float]:
+        """(confidence, interval_scale) for an item on a date.
+
+        An item that is otherwise trained but has never seen this day's major event
+        (first Ramadan, first kahk season) cannot be trusted as usual: the model's
+        learned effect for it is ~zero. With no rule layer to fall back to, we still
+        forecast, but mark it `low` confidence and widen the interval.
+        """
+        if self._target_unseen_event(target_date):
+            return "low", 1.35
+        return self._confidence(sku), 1.0
 
     def forecast(self, sku: str, target_date: dt.date) -> ForecastResult:
         if sku not in BY_SKU:
             raise KeyError(f"unknown SKU {sku!r}")
 
-        # Route per item and date: rule-based until it has enough history, and still
-        # rule-based on a major event the model has not yet trained through.
-        if not self._use_ml(sku, target_date):
-            return self._rule_forecast(sku, target_date)
+        # The gate: no trained model, no rules, no forecast. The caller shows
+        # "model still training" and falls back to whatever it controls.
+        if not self._use_ml(sku):
+            raise ModelNotReadyError(
+                f"no trained model for {sku!r} yet "
+                f"({self.observed_days.get(sku, 0)} of {self.train_threshold} days)"
+            )
 
+        confidence, scale = self._confidence_for_date(sku, target_date)
         row = self._row_for(sku, target_date)
         qty = float(self.point_model.predict(row)[0])
         low = float(self.low_model.predict(row)[0])
@@ -301,9 +310,9 @@ class ForecastService:
             sku=sku,
             date=target_date,
             quantity=int(round(qty)),
-            lower=int(round(min(low, qty))),
-            upper=int(round(max(high, qty))),
-            confidence=self._confidence(sku),
+            lower=int(round(min(low * scale, qty))),
+            upper=int(round(max(high * scale, qty))),
+            confidence=confidence,
             source="batch",
             factors=self._explain(sku, row),
         )
@@ -317,39 +326,40 @@ class ForecastService:
         """Forecast every item for one day in a single model pass.
 
         This is what the POS/e-commerce backend should call each morning: one request
-        for the whole production plan instead of one round-trip per SKU. Items that have
-        reached the training threshold run through the model in a single pass (rebuilding
-        the deseasonalised history only once); items still in cold start are answered
-        from the rules. Results keep the requested order.
+        for the whole production plan instead of one round-trip per SKU. Any item that
+        has not reached the training threshold has NO forecast (the rule layer is gone)
+        and raises `ModelNotReadyError` -- the caller should surface it as "still
+        training" rather than plan from nothing.
         """
         skus = skus or list(BY_SKU)
         unknown = [s for s in skus if s not in BY_SKU]
         if unknown:
             raise KeyError(f"unknown SKU(s): {', '.join(unknown)}")
 
-        ml_skus = [s for s in skus if self._use_ml(s, target_date)]
+        not_ready = [s for s in skus if not self._use_ml(s)]
+        if not_ready:
+            first = not_ready[0]
+            raise ModelNotReadyError(
+                f"no trained model for {first!r} yet "
+                f"({self.observed_days.get(first, 0)} of {self.train_threshold} days)"
+            )
+
         results: dict[str, ForecastResult] = {}
 
-        # Trained items: one batched model pass over all of them together.
-        if ml_skus:
-            rows = pd.concat([self._row_for(s, target_date) for s in ml_skus], ignore_index=True)
-            qty = self.point_model.predict(rows)
-            low = self.low_model.predict(rows)
-            high = self.high_model.predict(rows)
-            for i, sku in enumerate(ml_skus):
-                q = float(qty[i])
-                results[sku] = ForecastResult(
-                    sku=sku, date=target_date, quantity=int(round(q)),
-                    lower=int(round(min(float(low[i]), q))),
-                    upper=int(round(max(float(high[i]), q))),
-                    confidence=self._confidence(sku), source="batch",
-                    factors=self._explain(sku, rows.iloc[[i]]),
-                )
-
-        # Cold-start items: answered from the rules.
-        for sku in skus:
-            if sku not in results:
-                results[sku] = self._rule_forecast(sku, target_date)
+        rows = pd.concat([self._row_for(s, target_date) for s in skus], ignore_index=True)
+        qty = self.point_model.predict(rows)
+        low = self.low_model.predict(rows)
+        high = self.high_model.predict(rows)
+        for i, sku in enumerate(skus):
+            confidence, scale = self._confidence_for_date(sku, target_date)
+            q = float(qty[i])
+            results[sku] = ForecastResult(
+                sku=sku, date=target_date, quantity=int(round(q)),
+                lower=int(round(min(float(low[i]) * scale, q))),
+                upper=int(round(max(float(high[i]) * scale, q))),
+                confidence=confidence, source="batch",
+                factors=self._explain(sku, rows.iloc[[i]]),
+            )
 
         return [results[s] for s in skus]
 
@@ -369,21 +379,21 @@ class ForecastService:
     def seasonality_adjustment(self, sku: str, target_date: dt.date) -> dict:
         """Calendar-only view: how much does this date differ from a neutral one?
 
-        For trained items the multiplier comes straight from the decomposed model's
-        calendar component; for cold-start items it comes from the rule-based priors. In
-        both cases it is exactly the factor the forecast applies.
+        The multiplier comes from the decomposed model's learned calendar component.
+        An item with no trained model raises `ModelNotReadyError` -- there is no
+        rule-based priors layer left to answer for it.
         """
         cal = CALENDAR.features(target_date)
+        if not self._use_ml(sku):
+            raise ModelNotReadyError(
+                f"no trained model for {sku!r} yet "
+                f"({self.observed_days.get(sku, 0)} of {self.train_threshold} days)"
+            )
 
-        if self._use_ml(sku, target_date):
-            row = self._row_for(sku, target_date)
-            qty = float(self.point_model.predict(row)[0])
-            multiplier = float(self.point_model.calendar_multiplier(row)[0])
-            factors = self._explain(sku, row)
-        else:
-            from app.models.rule_based import rule_multiplier
-            multiplier, factors = rule_multiplier(self.rule_model.priors[sku], cal)
-            qty = float(self._rule_forecast(sku, target_date).quantity)
+        row = self._row_for(sku, target_date)
+        qty = float(self.point_model.predict(row)[0])
+        multiplier = float(self.point_model.calendar_multiplier(row)[0])
+        factors = self._explain(sku, row)
 
         base = qty / multiplier if multiplier > 0 else qty
 

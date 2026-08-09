@@ -451,7 +451,7 @@
             "status"
           ]
         },
-        "description": "بيوضّح كل صنف شغّال بإيه: `rule_based` (قواعد، مخبز لسه جديد) ولا `trained_model` (اتدرّب على 90 يوم+).\n\nلكل صنف: `observed_days` (عدد الأيام المتجمّعة)، `days_until_switch` (فاضل كام يوم للتحويل)، و`progress` (نسبة التقدّم). مفيد تعمل بيه progress bar في الفرونت.\n\n**الفكرة:** المخبز بيبدأ كله قواعد، وكل صنف يتحوّل للموديل لوحده لما يجمّع 90 يوم بيانات."
+        "description": "بيوضّح كل صنف شغّال بإيه: `untrained` (لسه بيجمّع بيانات، مفيش توقّع ليه لغاية 90 يوم) ولا `trained_model` (اتدرّب على 90 يوم+).\n\nلكل صنف: `observed_days` (عدد الأيام المتجمّعة)، `days_until_switch` (فاضل كام يوم للتحويل)، و`progress` (نسبة التقدّم). مفيد تعمل بيه progress bar في الفرونت.\n\n**الفكرة:** المخبز بيبدأ كله من غير توقّعات لحد ما كل صنف يجمّع 90 يوم بيانات ويهوّل للموديل لوحده."
       },
       "event": [
         {
@@ -462,7 +462,7 @@
               "pm.test(\"الرد 200\", () => pm.response.to.have.status(200));",
               "let j = pm.response.json();",
               "pm.test(\"فيه حد تدريب\", () => pm.expect(j.train_threshold_days).to.be.above(0));",
-              "pm.test(\"مجموع الأصناف صح\", () => pm.expect(j.items.length).to.eql(j.items_rule_based + j.items_trained));"
+              "pm.test(\"مجموع الأصناف صح\", () => pm.expect(j.items.length).to.eql(j.items_untrained + j.items_trained));"
             ]
           }
         }
@@ -524,7 +524,7 @@
             "status"
           ]
         },
-        "description": "بيوضّح كل صنف شغّال بقواعد (rule_based) ولا موديل مدرَّب (trained_model)، وكل صنف فاضله كام يوم للتحويل (90 يوم). مفيد لـ progress bar في الأدمن."
+        "description": "بيوضّح كل صنف شغّال بإيه: `untrained` (لسه بيجمّع بيانات، ومفيش توقّع ليه) ولا موديل مدرَّب `trained_model` (اتدرّب على 90 يوم+)، وكل صنف فاضله كام يوم للتحويل. مفيد لـ progress bar في الأدمن."
       },
       "event": [
         {
@@ -534,7 +534,7 @@
             "exec": [
               "pm.test(\"200\",()=>pm.response.to.have.status(200));",
               "let j=pm.response.json();",
-              "pm.test(\"مجموع الأصناف صح\",()=>pm.expect(j.items.length).to.eql(j.items_rule_based+j.items_trained));"
+              "pm.test(\"مجموع الأصناف صح\",()=>pm.expect(j.items.length).to.eql(j.items_untrained+j.items_trained));"
             ]
           }
         }
