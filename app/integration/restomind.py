@@ -99,6 +99,50 @@ class ProductInput:
     price: float = 0.0
     freshness_window: float | None = None   # days; RestoMind Product.freshnessWindow
     avg_daily_sales: float | None = None     # owner estimate; used until real data exists
+    # Set ONLY when avg_daily_sales is a mean measured over real days. Its presence is
+    # what tells us the figure carries that window's calendar and must be deseasonalised
+    # before the target day's multiplier is applied. Absent = an ordinary-day figure
+    # (an owner's estimate), used as-is.
+    avg_daily_sales_window: tuple[dt.date, dt.date] | None = None
+
+
+def deseasonalise(
+    raw_mean: float, category: str | None, window: tuple[dt.date, dt.date],
+) -> float:
+    """Convert a raw daily mean measured over `window` into an ordinary-day level.
+
+    Every `base` this module multiplies by a calendar multiplier must be a QUIET-day
+    level -- the mean of ordinary, non-event days. The registry's learned level already
+    is one, because it averages only non-event days. A caller's measured mean is not:
+    it is averaged over whatever the window happened to contain, weekends and Ramadan
+    included.
+
+    Feeding a raw mean in as `base` therefore applies the calendar twice. A 14-day
+    window sitting inside Ramadan is already inflated by Ramadan, and then gets the
+    Ramadan multiplier on top -- over-forecast, over-produce, waste, during the exact
+    season the product exists to get right.
+
+    Dividing by the window's own mean multiplier undoes that: it recovers the level the
+    window implies for an ordinary day, which the caller's multiplier can then act on.
+    """
+    priors = category_priors(map_category(category))
+    start, end = window
+    if end < start:
+        start, end = end, start
+
+    mults: list[float] = []
+    day = start
+    while day <= end:
+        mult, _ = rule_multiplier(priors, CALENDAR.features(day))
+        mults.append(mult)
+        day += dt.timedelta(days=1)
+
+    mean_mult = sum(mults) / len(mults) if mults else 1.0
+    # A degenerate multiplier would turn a real level into an absurd one; leaving the
+    # mean untouched is the safe failure here, not dividing by ~0.
+    if mean_mult <= 0.01:
+        return raw_mean
+    return raw_mean / mean_mult
 
 
 def _forecast_one(
@@ -109,14 +153,24 @@ def _forecast_one(
     Shared by the daily production plan and the weekly prediction so both always agree.
     `level` overrides the daily baseline when a value learned from real sales exists
     (see the multi-tenant registry); otherwise the owner's estimate / default is used.
+
+    Whatever `base` ends up being, it must be an ORDINARY-day level, because `mult`
+    is applied on top. See `deseasonalise`.
     """
     priors = category_priors(map_category(p.category))
     mult, factors = rule_multiplier(priors, feats)
     if level is not None:
+        # Learned from real sales, already averaged over non-event days only.
         base = level
     elif p.avg_daily_sales is not None:
         # 0.0 is a real answer ("this product sells nothing"), not a missing value.
         base = p.avg_daily_sales
+        if p.avg_daily_sales_window is not None:
+            # The caller measured this over a real window, so it carries that
+            # window's calendar. Strip it back out before re-applying the target
+            # day's. Without the window we must assume an ordinary-day figure --
+            # which is what an owner's estimate is.
+            base = deseasonalise(base, p.category, p.avg_daily_sales_window)
     else:
         base = DEFAULT_DAILY_LEVEL
     return base * mult, factors
@@ -312,10 +366,14 @@ def surplus_offers(
         learned_level, _, _ = levels.get(s.product_id, (None, "rule_based", "low"))
         if learned_level is not None:
             base_level = learned_level
+        elif s.avg_daily_sales is not None:
+            base_level = s.avg_daily_sales
+            # `mult` is applied below, so base_level must be an ordinary-day level.
+            # Same double-count as _forecast_one otherwise.
+            if s.avg_daily_sales_window is not None:
+                base_level = deseasonalise(base_level, s.category, s.avg_daily_sales_window)
         else:
-            base_level = (
-                s.avg_daily_sales if s.avg_daily_sales is not None else DEFAULT_DAILY_LEVEL
-            )
+            base_level = DEFAULT_DAILY_LEVEL
         day_level = base_level * mult
         expected_remaining = day_level * remaining_share
 
