@@ -9,7 +9,7 @@ rather than a guessed number.
 from fastapi.testclient import TestClient
 import pytest
 
-from app.api.main import app
+from app.api.main import app, STATE
 from app.integration.restomind import to_business_time
 
 import datetime as dt
@@ -20,7 +20,14 @@ os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
 
 @pytest.fixture(scope="module")
 def client():
+    """A client whose service has been loaded with the SIMULATED dataset.
+
+    The app boots cold by design (COLD_START defaults to true). The bridge tests
+    that assert a catalogue SKU reaches the trained model need that model to
+    exist, so train the running service rather than changing how the app starts.
+    """
     with TestClient(app) as c:
+        STATE["forecast"].train()
         yield c
 
 
@@ -123,7 +130,8 @@ def test_surplus_offers_flags_risk_and_writes_arabic_copy(client):
     assert len(items) > 0
     for it in items:
         assert 5 <= it["suggestedDiscountPct"] <= 70
-        assert it["offerCopyAr"] and it["title"] in it["offerCopyAr"]
+        assert "offerCopyAr" not in it
+        assert "newPrice" not in it
 
 
 def test_surplus_quiet_in_the_morning(client):

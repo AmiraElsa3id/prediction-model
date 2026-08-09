@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.main import app
+from app.api.main import app, STATE
 
 import os
 
@@ -15,7 +15,16 @@ os.environ.setdefault("REGISTRY_STORE", "")   # in-memory registry for tests
 
 @pytest.fixture(scope="module")
 def client():
+    """A client whose service has been loaded with the SIMULATED dataset.
+
+    The app boots cold by design (COLD_START defaults to true), so a freshly
+    started service has no history and no catalogue -- nothing here would be
+    forecastable. These tests exist to exercise the model, so they train the
+    running service explicitly rather than flipping the app's default: the boot
+    path under test stays exactly the one production uses.
+    """
     with TestClient(app) as c:
+        STATE["forecast"].train()      # base_data_source -> "simulated"
         yield c
 
 
@@ -170,38 +179,6 @@ def test_surplus_detect_reads_an_offset_aware_timestamp_as_cairo(client):
     )
 
 
-def test_generate_offer_returns_egyptian_arabic(client):
-    r = client.post("/marketing/generate-offer",
-                    json={"sku": "CAKE_GATEAU", "discount_pct": 30})
-    assert r.status_code == 200
-    b = r.json()
-    assert "جاتوه" in b["copy_ar"]
-    # Offer terms stated either as a percentage or as a price pair.
-    assert "30" in b["copy_ar"] or ("24" in b["copy_ar"] and "35" in b["copy_ar"])
-    assert b["new_price"] < b["old_price"]
-    assert b["generator"] in {"llm", "template"}
-
-
-def test_publish_defaults_to_dry_run(client):
-    r = client.post("/marketing/publish",
-                    json={"sku": "CAKE_GATEAU", "copy_ar": "عرض تجريبي",
-                          "platforms": ["facebook"]})
-    b = r.json()
-    assert b["status"] == "preview"
-    assert b["dry_run"] is True
-    assert b["post_ids"] == {}
-
-
-def test_publish_live_refuses_without_credentials(client):
-    """Live publishing must fail closed, never silently no-op as if it worked."""
-    r = client.post("/marketing/publish",
-                    json={"sku": "CAKE_GATEAU", "copy_ar": "عرض تجريبي",
-                          "platforms": ["facebook"], "dry_run": False})
-    b = r.json()
-    assert b["status"] == "failed"
-    assert b["post_ids"] == {}
-
-
 # -- batch endpoints ----------------------------------------------------------------
 
 
@@ -326,24 +303,6 @@ def test_default_tier_rate_limit_returns_429_with_retry_after(monkeypatch, clien
     assert limited.status_code == 429
     assert "retry-after" in {k.lower() for k in limited.headers.keys()}
     assert limited.json()["error"] == "rate_limited"
-
-
-def test_marketing_tier_has_its_own_tighter_budget(monkeypatch, client):
-    """The marketing tier's limit is tracked separately from the default tier, so heavy
-    (legitimate) forecast traffic can't starve it, and vice versa.
-    """
-    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
-    monkeypatch.setattr(ratelimit, "MARKETING_LIMIT_PER_MIN", 2)
-
-    payload = {"sku": "CAKE_GATEAU", "discount_pct": 30}
-    for _ in range(2):
-        assert client.post("/marketing/generate-offer", json=payload).status_code == 200
-
-    limited = client.post("/marketing/generate-offer", json=payload)
-    assert limited.status_code == 429
-
-    # A different tier's budget is untouched by marketing's limit being tripped.
-    assert client.get("/model/status").status_code == 200
 
 
 def test_health_stays_exempt_from_rate_limiting(monkeypatch, client):
