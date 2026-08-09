@@ -21,6 +21,7 @@ existing e-commerce/POS system.
 | Daily production forecast, with confidence interval and explanation | `POST /forecast/daily` |
 | **Daily forecast for every item in one call** (for the POS backend) | `POST /forecast/daily-batch` |
 | 7-day production plan (single item / all items) | `POST /forecast/weekly`, `POST /forecast/weekly-batch` |
+| **Register/refresh item economics (dynamic catalogue)** | `POST /catalogue/upsert` |
 | Calendar effect for a date (Ramadan/Eid/…), with attribution | `POST /forecast/seasonality-adjustment` |
 | Warn when a manual production entry will cause waste | `POST /alerts/waste-prevention` |
 | Detect stagnant stock near closing and size a discount | `POST /surplus/detect` |
@@ -74,6 +75,29 @@ is **no forecast at all** — the system is honest instead of handing the store 
 
 The 90-day threshold is configurable (`ForecastService(train_threshold=...)`). Start the
 service with no history via `COLD_START=true`.
+
+## Dynamic catalogue (items are what you upload, not a fixed 11)
+
+There is no hardcoded item list at runtime. The service learns its items from uploaded
+data and nothing else:
+
+- On a clean start (`COLD_START=true`) `/model/status` reports **zero** items and
+  `/forecast/*` answers *not found* until data arrives — it never pretends to know
+  products the bakery hasn't given it.
+- Items become known in one of two ways: the backend posts its product menu to
+  `POST /catalogue/upsert` (SKU + price/cost/shelf life), or sales arrive at
+  `POST /data/ingest` carrying those economics — a SKU is registered the first night
+  its actuals arrive.
+- The newsvendor quantile (how conservatively each item is forecast) is derived **per
+  item from its own uploaded economics**, `q* = Cu/(Cu+Co)`, so a brand-new SKU gets a
+  sane service level from day one.
+- `/model/status`, `/forecast/*`, `/alerts/*`, `/surplus/*` and `/marketing/*` all read
+  the same per-service `Catalogue`, so an unknown SKU is a clear 404 with a hint, never
+  a guess.
+
+The 11-item set still exists in `app/core/items.py` — as **simulation fixtures** for the
+synthetic generator, the backtest, the business simulation and the demo dashboard. The
+running service never consults it.
 
 ## Documentation
 

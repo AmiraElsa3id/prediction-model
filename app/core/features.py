@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from app.core.egypt_calendar import CALENDAR
-from app.core.items import BY_SKU
+from app.core.items import newsvendor_q_from_row
 
 # Lags and rolling windows offered to the model, subject to the horizon constraint.
 LAG_DAYS = [1, 2, 7, 14, 28]
@@ -77,7 +77,8 @@ def mark_closed_days(df: pd.DataFrame) -> pd.DataFrame:
         g["sku"] = sku
         g["is_closed"] = g["sales_qty"].isna().astype(int)
         # Static per-item attributes survive the reindex.
-        for col in ("branch", "item_name_ar", "category", "unit_price", "unit_cost"):
+        for col in ("branch", "item_name_ar", "category", "unit_price", "unit_cost",
+                    "shelf_life_days"):
             if col in g.columns:
                 g[col] = g[col].ffill().bfill()
         frames.append(g.reset_index())
@@ -222,8 +223,15 @@ def build_features(
     out = flag_outliers(out, target=target)
 
     out["sku_code"] = out["sku"].astype("category").cat.codes
-    out["newsvendor_q"] = out["sku"].map(
-        lambda s: BY_SKU[s].newsvendor_quantile if s in BY_SKU else 0.5
+    # Newsvendor q* comes from the data's own economics (unit_price/unit_cost/shelf
+    # life), not a fixed catalogue -- every SKU in the frame, known or brand new, gets
+    # a per-item service level. Defaults to 0.5 when economics are missing.
+    for col in ("shelf_life_days", "unit_price", "unit_cost"):
+        if col not in out.columns:
+            out[col] = 0 if col != "shelf_life_days" else 1
+    out["newsvendor_q"] = out[["sku", "unit_price", "unit_cost", "shelf_life_days"]].apply(
+        lambda r: newsvendor_q_from_row(r.to_dict()),
+        axis=1,
     )
     return out.reset_index(drop=True)
 

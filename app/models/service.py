@@ -22,7 +22,7 @@ import pandas as pd
 from app.core.egypt_calendar import CALENDAR
 from app.core.features import build_features
 from app.core.generate import generate
-from app.core.items import BY_SKU, Item
+from app.core.items import Item, Catalogue
 from app.models.forecaster import CalendarDecomposed
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
@@ -62,6 +62,10 @@ class ForecastService:
     def __init__(self, horizon: int = 1, train_threshold: int = TRAIN_THRESHOLD_DAYS) -> None:
         self.horizon = horizon
         self.train_threshold = train_threshold
+        # The DYNAMIC item registry: populated only from uploaded data (see `Catalogue`).
+        # Empty catalogue => nothing is known, nothing forecastable -- that is the honest
+        # answer for a brand-new bakery with no uploaded items.
+        self.catalogue = Catalogue()
         # ML models start empty. Without the rule-based layer there is no afternoon
         # fallback: an item only has a forecast once its model exists and is over the
         # training threshold.
@@ -135,6 +139,9 @@ class ForecastService:
         raw = generate() if raw is None else raw
         self.history = raw.copy()
         self.base_data_source = "simulated" if _generated else "real"
+        # Items are whatever the data contains; the runtime catalogue never uses the
+        # hardcoded simulation fixtures.
+        self.catalogue.register_from_data(self.history)
         self._recount_days()
 
         # Fit the ML model only if some item has enough history to justify it.
@@ -143,7 +150,7 @@ class ForecastService:
         return self
 
     def start_cold(self) -> "ForecastService":
-        """Begin with zero history: no model, so nothing is forecastable yet."""
+        """Begin with zero history: no model, no items, so nothing is forecastable yet."""
         self.history = None
         self.features = None
         self.observed_days = {}
@@ -156,7 +163,32 @@ class ForecastService:
         self.trained_at = None
         self.base_data_source = "none"
         self.real_ingest_rows = 0
+        # The dynamic catalogue resets with the history: nothing uploaded => nothing known.
+        self.catalogue = Catalogue()
         return self
+
+    def register_item(
+        self,
+        sku: str,
+        *,
+        unit_price: float = 0.0,
+        unit_cost: float = 0.0,
+        shelf_life_days: int = 1,
+        name_ar: str = "",
+        name_en: str = "",
+        category: str = "general",
+    ) -> None:
+        """Register/refresh one item in the dynamic catalogue without any sales data.
+
+        This is how a backend syncs its product menu to the model before or alongside
+        posting history. Registering alone does NOT train anything -- the item still
+        needs cross-threshold history before a forecast exists.
+        """
+        self.catalogue.register(
+            sku, unit_price=unit_price, unit_cost=unit_cost,
+            shelf_life_days=shelf_life_days, name_ar=name_ar,
+            name_en=name_en, category=category,
+        )
 
     def ingest(self, records: pd.DataFrame) -> dict:
         """Append end-of-day actuals and retrain if an item crosses the threshold.
@@ -166,6 +198,8 @@ class ForecastService:
         """
         records = records.copy()
         records["date"] = pd.to_datetime(records["date"])
+        # New SKUs (with their economics) become known the moment their data arrives.
+        self.catalogue.register_from_data(records)
         self.history = records if self.history is None else pd.concat(
             [self.history, records], ignore_index=True
         ).drop_duplicates(subset=["date", "sku"], keep="last")
@@ -231,7 +265,7 @@ class ForecastService:
         above it the trained model serves it.
         """
         items = []
-        for sku in BY_SKU:
+        for sku in self.catalogue.skus():
             days = int(self.observed_days.get(sku, 0))
             ml = self._use_ml(sku)
             items.append({
@@ -329,7 +363,7 @@ class ForecastService:
         return self._confidence(sku), 1.0
 
     def forecast(self, sku: str, target_date: dt.date) -> ForecastResult:
-        if sku not in BY_SKU:
+        if sku not in self.catalogue:
             raise KeyError(f"unknown SKU {sku!r}")
 
         # The gate: no trained model, no rules, no forecast. The caller shows
@@ -371,8 +405,8 @@ class ForecastService:
         and raises `ModelNotReadyError` -- the caller should surface it as "still
         training" rather than plan from nothing.
         """
-        skus = skus or list(BY_SKU)
-        unknown = [s for s in skus if s not in BY_SKU]
+        skus = skus or self.catalogue.skus()
+        unknown = [s for s in skus if s not in self.catalogue]
         if unknown:
             raise KeyError(f"unknown SKU(s): {', '.join(unknown)}")
 
@@ -407,7 +441,7 @@ class ForecastService:
         self, start: dt.date, skus: list[str] | None = None,
     ) -> dict[str, list[ForecastResult]]:
         """Seven-day plan for every item, keyed by SKU. One model pass per day."""
-        skus = skus or list(BY_SKU)
+        skus = skus or self.catalogue.skus()
         by_sku: dict[str, list[ForecastResult]] = {s: [] for s in skus}
         for i in range(7):
             for r in self.forecast_all(start + dt.timedelta(days=i), skus):
@@ -466,7 +500,7 @@ class ForecastService:
         forecast: we only object when the plan is outside what the model considers
         plausible at all.
         """
-        item: Item = BY_SKU[sku]
+        item: Item = self.catalogue.get(sku)
         fc = self.forecast(sku, target_date)
 
         excess = planned_qty - fc.upper

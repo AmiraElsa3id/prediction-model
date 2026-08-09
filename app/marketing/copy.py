@@ -21,6 +21,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from typing import Mapping
 
 from app.core.items import BY_SKU, Item
 
@@ -237,8 +238,14 @@ class OfferService:
     def build(
         self, sku: str, discount_pct: int, close_time: str = "10 بالليل",
         valid_until: str | None = None,
+        catalogue: Mapping[str, object] | None = None,
     ) -> Offer:
-        item = BY_SKU[sku]
+        if catalogue is not None:
+            item = catalogue.get(sku)
+            if item is None:
+                raise KeyError(f"unknown SKU {sku!r}")
+        else:
+            item = BY_SKU[sku]
         text, used = None, "template"
 
         if self.llm.available:

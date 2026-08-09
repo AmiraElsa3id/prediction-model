@@ -103,7 +103,7 @@ class Item:
 
 # Ramadan reshapes the day completely: nothing is eaten in daylight, then a large
 # iftar with dessert. Breakfast items collapse; desserts roughly double.
-CATALOGUE: list[Item] = [
+_CATALOGUE: list[Item] = [
     Item(
         sku="BREAD_BALADI", name_ar="عيش بلدي", name_en="Baladi Bread",
         category="bread", unit_price=1.5, unit_cost=0.9, shelf_life_days=1,
@@ -175,14 +175,188 @@ CATALOGUE: list[Item] = [
     ),
 ]
 
+# These 11 items are the SIMULATION fixtures, not a runtime catalogue. generate() needs
+# known items with known effect sizes to synthesise the demo dataset, and the demo
+# scripts (dashboard, run_simulation, backtest) are written against them. The running
+# service does NOT know them by default: it learns its items from uploaded data (COLD
+# START / dynamic catalogue, see `Catalogue` below). The /model/status and forecast
+# routes never consult this mapping.
+CATALOGUE: list[Item] = _CATALOGUE
+
+# Back-compat alias for demo scripts and the test suite, so they keep working against
+# the synthetic fixtures. Runtime code uses Catalogue instead.
 BY_SKU: dict[str, Item] = {i.sku: i for i in CATALOGUE}
 
 
 def get_item(sku: str) -> Item:
-    """Look up an item, raising a clear error for an unknown SKU."""
+    """Look up a synthetic fixture item, raising a clear error for an unknown SKU."""
     try:
         return BY_SKU[sku]
     except KeyError:
         raise KeyError(
             f"Unknown SKU {sku!r}. Known SKUs: {', '.join(sorted(BY_SKU))}"
         ) from None
+
+
+class Catalogue:
+    """A dynamic, per-service item registry.
+
+    The runtime equivalent of the fixed `BY_SKU`: items are registered from whatever a
+    real bakery/user actually uploads (via /catalogue/upsert or the economics attached
+    to ingested sales). A brand-new bakery with nothing uploaded has an EMPTY catalogue
+    -- no hardcoded 11, no forecast for anything until its own items arrive.
+
+    Items are registered by their economics because those set the newsvendor quantile
+    that decides how conservative the forecast is. Where uploads omit a field the
+    sensible bakery default is applied (same-day shelf life, zero price/cost only when
+    genuinely unknown).
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[str, Item] = {}
+
+    def register(
+        self,
+        sku: str,
+        *,
+        unit_price: float | None = None,
+        unit_cost: float | None = None,
+        shelf_life_days: int | None = None,
+        name_ar: str | None = None,
+        name_en: str | None = None,
+        category: str | None = None,
+    ) -> Item:
+        """Register or refresh one item, returning it.
+
+        Precedence for each field: an explicitly provided value > the previously
+        registered value > the synthetic fixture (if any) > the bare default. This
+        keeps economics intact when a caller refreshes an item without restating them
+        (e.g. an ingest that only sends sales).
+        """
+        prev = self._items.get(sku)
+        base = _CATALOGUE_BY_SKU.get(sku)
+
+        # Empty/zero explicit values mean "not stated" -- preserve the previous value
+        # (or the fixture) rather than clobbering a good registration with a default.
+        unit_price = unit_price if unit_price else None
+        unit_cost = unit_cost if unit_cost else None
+        shelf_life_days = shelf_life_days if shelf_life_days else None
+        name_ar = name_ar or None
+        name_en = name_en or None
+        category = category or None
+
+        def pick(provided, prev_val, base_val, default):
+            if provided is not None:
+                return provided
+            if prev_val is not None:
+                return prev_val
+            return base_val if base_val is not None else default
+
+        item = Item(
+            sku=sku,
+            name_ar=pick(name_ar, prev.name_ar if prev else None,
+                         base.name_ar if base else None, sku),
+            name_en=pick(name_en, prev.name_en if prev else None,
+                         base.name_en if base else None, sku),
+            category=pick(category if category else None,
+                          prev.category if prev else None,
+                          base.category if base else None, "general"),
+            unit_price=float(pick(unit_price, prev.unit_price if prev else None,
+                                  base.unit_price if base else None, 0.0)),
+            unit_cost=float(pick(unit_cost, prev.unit_cost if prev else None,
+                                 base.unit_cost if base else None, 0.0)),
+            shelf_life_days=int(pick(shelf_life_days, prev.shelf_life_days if prev else None,
+                                     base.shelf_life_days if base else None, 1)),
+            base_daily_demand=(prev.base_daily_demand if prev else
+                               (base.base_daily_demand if base else 0.0)),
+        )
+        self._items[sku] = item
+        return item
+
+    def get(self, sku: str, default=None) -> Item | None:
+        return self._items.get(sku, default)
+
+    def skus(self) -> list[str]:
+        return sorted(self._items)
+
+    def items(self) -> list[Item]:
+        return [self._items[s] for s in self.skus()]
+
+    def as_dict(self) -> dict[str, Item]:
+        return dict(self._items)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def __contains__(self, sku: object) -> bool:
+        return sku in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def register_from_data(self, rows: pd.DataFrame | None) -> None:
+        """Register every SKU present in a data frame, taking economics from its columns.
+
+        The synthetic generator and ingest payloads carry `unit_price` / `unit_cost`
+        (and optionally `shelf_life_days`) per row, so a data-driven item registry needs
+        no separate metadata call -- an SKU becomes known the first time data about it
+        arrives.
+        """
+        if rows is None or rows.empty:
+            return
+        for sku, grp in rows.groupby("sku", sort=False):
+            first = grp.iloc[0]
+            price = float(first.get("unit_price", 0.0) or 0.0) or None
+            cost = float(first.get("unit_cost", 0.0) or 0.0) or None
+            shelf = int(first.get("shelf_life_days", 1) or 1) or None
+            self.register(
+                sku,
+                unit_price=price,
+                unit_cost=cost,
+                shelf_life_days=shelf,
+                name_ar=str(first.get("item_name_ar", "") or "") or None,
+                name_en=str(first.get("item_name_en", "") or "") or None,
+                category=str(first.get("category", "") or "") or None,
+            )
+
+
+def new_item_from_row(row) -> Item:
+    """Build an Item from an uploaded/simulated data row.
+
+    Economics (price/cost/shelf life) are read from the row's columns when present,
+    defaulting to a same-day staple otherwise. This is what keeps the forecast
+    profit-optimal per item without a fixed catalogue.
+    """
+    price = float(row.get("unit_price", 0.0) or 0.0)
+    cost = float(row.get("unit_cost", 0.0) or 0.0)
+    shelf = int(row.get("shelf_life_days", 1) or 1)
+    return Item(
+        sku=str(row["sku"]),
+        name_ar=str(row.get("item_name_ar", "") or ""),
+        name_en=str(row.get("item_name_en", "") or ""),
+        category=str(row.get("category", "") or "general"),
+        unit_price=price,
+        unit_cost=cost,
+        shelf_life_days=shelf,
+        base_daily_demand=float(row.get("base_daily_demand", 0.0) or 0.0),
+    )
+
+
+def newsvendor_q_from_row(row) -> float:
+    """Profit-optimal quantile from a data row's own economics (defaults: 0.5).
+
+    Used wherever a model must know how conservatively to forecast a SKU WITHOUT a
+    fixed catalogue lookup -- the newsvendor q* is derived from the uploaded price,
+    cost and shelf life, so a brand new SKU still gets a sane service level.
+    """
+    item = new_item_from_row(row)
+    base = _CATALOGUE_BY_SKU.get(item.sku)
+    if item.unit_price <= 0 or item.unit_cost <= 0:
+        return (base.newsvendor_quantile if base else 0.5)
+    return item.newsvendor_quantile
+
+
+_CATALOGUE_BY_SKU: dict[str, Item] = {i.sku: i for i in CATALOGUE}

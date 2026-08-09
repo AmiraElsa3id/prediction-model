@@ -176,6 +176,7 @@ def generate(
                 "is_stockout": is_stockout,
                 "unit_price": item.unit_price,
                 "unit_cost": item.unit_cost,
+                "shelf_life_days": item.shelf_life_days,
                 "revenue": round(sales * item.unit_price, 2),
                 "waste_cost": round(leftover * item.unit_cost, 2),
                 # Ground truth -- available here, never in production.

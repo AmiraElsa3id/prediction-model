@@ -11,18 +11,14 @@ import datetime as dt
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.items import BY_SKU
-
 
 class SKUMixin(BaseModel):
-    """Shared SKU validation so an unknown item fails at the edge with a clear message."""
+    """Base for request bodies that carry a single SKU.
 
-    @field_validator("sku", check_fields=False)
-    @classmethod
-    def _known_sku(cls, v: str) -> str:
-        if v not in BY_SKU:
-            raise ValueError(f"unknown SKU '{v}'. Known: {', '.join(sorted(BY_SKU))}")
-        return v
+    Deliberately does NOT validate the SKU against a fixed list: the item catalogue is
+    dynamic (built from uploaded data), so an unknown SKU is decided at the service
+    layer, which raises a 404 with a clear message.
+    """
 
 
 # -- forecasting ---------------------------------------------------------------------
@@ -78,11 +74,8 @@ class DailyBatchRequest(BaseModel):
     @field_validator("skus")
     @classmethod
     def _known_skus(cls, v: list[str] | None) -> list[str] | None:
-        if v is None:
-            return v
-        unknown = set(v) - set(BY_SKU)
-        if unknown:
-            raise ValueError(f"unknown SKUs: {', '.join(sorted(unknown))}")
+        # Catalogue is dynamic (uploaded items), so SKU existence is validated at the
+        # service layer, not here.
         return v
 
 
@@ -102,11 +95,8 @@ class WeeklyBatchRequest(BaseModel):
     @field_validator("skus")
     @classmethod
     def _known_skus(cls, v: list[str] | None) -> list[str] | None:
-        if v is None:
-            return v
-        unknown = set(v) - set(BY_SKU)
-        if unknown:
-            raise ValueError(f"unknown SKUs: {', '.join(sorted(unknown))}")
+        # Catalogue is dynamic (uploaded items), so SKU existence is validated at the
+        # service layer, not here.
         return v
 
 
@@ -122,20 +112,22 @@ class WeeklyBatchResponse(BaseModel):
 
 
 class SalesRecord(BaseModel):
-    """One end-of-day actual for one item at one branch."""
+    """One end-of-day actual for one item at one branch.
+
+    `unit_price`, `unit_cost` and `shelf_life_days` are optional economics. When
+    present they register/refresh the SKU in the dynamic catalogue and set the
+    newsvendor quantile that decides how conservatively it is forecast. Omitted for an
+    already-known item: keep forecasting with its registered economics.
+    """
 
     date: dt.date = Field(..., description="Business day")
     sku: str = Field(..., description="Item SKU")
     sales_qty: int = Field(..., ge=0, description="Units actually sold")
     production_qty: int = Field(..., ge=0, description="Units produced that day")
     closing_stock: int = Field(0, ge=0, description="Unsold units at close (leftover)")
-
-    @field_validator("sku")
-    @classmethod
-    def _known(cls, v: str) -> str:
-        if v not in BY_SKU:
-            raise ValueError(f"unknown SKU '{v}'")
-        return v
+    unit_price: float | None = Field(None, ge=0, description="Selling price, EGP")
+    unit_cost: float | None = Field(None, ge=0, description="Production cost, EGP")
+    shelf_life_days: int | None = Field(None, ge=1, description="Shelf life in days")
 
 
 class IngestRequest(BaseModel):
@@ -169,6 +161,34 @@ class ModelStatusResponse(BaseModel):
     items_untrained: int
     items_trained: int
     items: list[ItemModeStatus]
+
+
+# -- dynamic catalogue ---------------------------------------------------------------
+
+
+class CatalogueItem(BaseModel):
+    """One item to register in the runtime catalogue (the statics /economics)."""
+
+    sku: str = Field(..., description="Item SKU")
+    unit_price: float = Field(0.0, ge=0, description="Selling price, EGP")
+    unit_cost: float = Field(0.0, ge=0, description="Production cost, EGP")
+    shelf_life_days: int = Field(1, ge=1, description="Shelf life in days")
+    name_ar: str = Field("", description="Arabic name")
+    name_en: str = Field("", description="English name")
+    category: str = Field("general", description="Category (bread/pastry/...)")
+
+
+class CatalogueUpsertRequest(BaseModel):
+    items: list[CatalogueItem] = Field(
+        ..., min_length=1,
+        description="Items to register/refresh. Registering alone does not train "
+                    "anything -- history is still required before a forecast exists.",
+    )
+
+
+class CatalogueUpsertResponse(BaseModel):
+    registered: list[str]
+    count: int
 
 
 # -- seasonality ---------------------------------------------------------------------
@@ -236,9 +256,7 @@ class SurplusRequest(BaseModel):
     @field_validator("stock")
     @classmethod
     def _known_skus(cls, v: dict[str, int]) -> dict[str, int]:
-        unknown = set(v) - set(BY_SKU)
-        if unknown:
-            raise ValueError(f"unknown SKUs: {', '.join(sorted(unknown))}")
+        # Catalogue is dynamic; SKU existence is validated at the service layer.
         return v
 
 

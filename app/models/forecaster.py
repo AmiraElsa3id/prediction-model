@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 
 from app.core.features import feature_columns, training_mask
-from app.core.items import BY_SKU
 
 
 class BaseForecaster:
@@ -118,7 +117,9 @@ class LightGBMQuantile(BaseForecaster):
     def _quantiles_to_fit(self, train: pd.DataFrame) -> list[float]:
         if self.quantile is not None:
             return [self.quantile]
-        return sorted({BY_SKU[s].newsvendor_quantile for s in train["sku"].unique() if s in BY_SKU})
+        # q* per SKU comes from the data's own economics via the `newsvendor_q` column
+        # (built in features.build_features). Distinct q* values become distinct boosters.
+        return sorted({float(q) for q in train["newsvendor_q"].dropna().unique()})
 
     def _impute_censored(
         self, train: pd.DataFrame, features: list[str],
@@ -233,10 +234,8 @@ class LightGBMQuantile(BaseForecaster):
         if self.quantile is not None:
             out = self._models[self.quantile].predict(X)
         else:
-            # Route each row to the booster trained at its item's q*.
-            q_by_row = test["sku"].map(
-                lambda s: BY_SKU[s].newsvendor_quantile if s in BY_SKU else 0.5
-            ).to_numpy()
+            # Route each row to the booster trained at its item's q* (data-derived).
+            q_by_row = test["newsvendor_q"].to_numpy(dtype=float)
             for q, model in self._models.items():
                 sel = q_by_row == q
                 if sel.any():

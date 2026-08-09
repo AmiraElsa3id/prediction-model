@@ -29,10 +29,15 @@ def full():
 
 def test_cold_start_has_no_forecast_at_all():
     svc = ForecastService(train_threshold=90).start_cold()
+    # On a truly empty catalogue nothing is registered -- the honest no-data answer.
+    assert svc.status()["items"] == []
+    # Register an item: it is known but still untrained, so there is NO forecast --
+    # not a guessed number (the dynamic catalogue is what decides whether a SKU is
+    # even known; training history decides whether it is forecastable).
+    svc.register_item("PASTRY_CROISSANT", unit_price=18.0, unit_cost=9.5, shelf_life_days=2)
     st = svc.status()
     assert st["items_untrained"] == len(st["items"])
     assert st["items_trained"] == 0
-    # With the rules gone there is NO forecast, not a guessed number.
     with pytest.raises(ModelNotReadyError):
         svc.forecast("PASTRY_CROISSANT", NORMAL_DAY)
 
@@ -85,6 +90,7 @@ def test_ingest_reports_transitions(full):
 
 def test_forecast_all_raises_model_not_ready_while_training():
     svc = ForecastService(train_threshold=90).start_cold()
+    svc.register_item("PASTRY_CROISSANT", unit_price=18.0, unit_cost=9.5, shelf_life_days=2)
     with pytest.raises(ModelNotReadyError):
         svc.forecast_all(NORMAL_DAY, ["PASTRY_CROISSANT"])
 
@@ -124,6 +130,7 @@ def test_data_source_is_honest_about_real_ingest(full):
 def test_status_reports_progress_towards_trained():
     """status() keeps driving a per-item progress bar, now toward 'trained'."""
     svc = ForecastService(train_threshold=90).start_cold()
+    svc.register_item("PASTRY_CROISSANT", unit_price=18.0, unit_cost=9.5, shelf_life_days=2)
     item = svc.status()["items"][0]
     assert item["mode"] == "untrained"
     assert item["progress"] == 0.0

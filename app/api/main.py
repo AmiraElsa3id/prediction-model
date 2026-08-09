@@ -19,7 +19,6 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from app.api import auth, ratelimit, schemas
-from app.core.items import BY_SKU
 from app.core.surplus import detect_surplus
 from app.integration import restomind
 from app.integration.registry import RestaurantRegistry
@@ -153,12 +152,16 @@ def _trained_model() -> ForecastService | None:
 
 @app.exception_handler(KeyError)
 async def _key_error_handler(request, exc: KeyError) -> JSONResponse:
+    service = STATE.get("forecast")
+    known = sorted(service.catalogue.skus()) if service and service.catalogue else []
+    hint = f"Known SKUs: {', '.join(known)}" if known else \
+        "No items registered yet -- upload items (POST /catalogue/upsert) or sales."
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
         content=schemas.ErrorResponse(
             error="not_found",
             detail=str(exc).strip("'\""),
-            hint=f"Known SKUs: {', '.join(sorted(BY_SKU))}",
+            hint=hint,
         ).model_dump(),
     )
 
@@ -192,7 +195,7 @@ def health() -> dict:
     return {
         "status": "ok" if service else "training",
         "model_trained_at": service.trained_at.isoformat() if service and service.trained_at else None,
-        "known_skus": len(BY_SKU),
+        "known_skus": len(service.catalogue) if service and service.catalogue else 0,
         "data_source": service.data_source() if service else "NONE",
     }
 
@@ -226,8 +229,37 @@ def ingest(req: schemas.IngestRequest) -> schemas.IngestResponse:
     records["is_stockout"] = (
         (records["sales_qty"] >= records["production_qty"]) & (records["closing_stock"] == 0)
     ).astype(int)
+    # Economics in the payload register the SKU in the dynamic catalogue (via the
+    # service's ingest), so a brand-new item becomes known the first night its sales
+    # arrive. Drop None columns so register_from_data sees only what the caller sent.
     out = _service().ingest(records)
     return schemas.IngestResponse(**out)
+
+
+@app.post("/catalogue/upsert", response_model=schemas.CatalogueUpsertResponse, tags=["lifecycle"])
+def catalogue_upsert(req: schemas.CatalogueUpsertRequest) -> schemas.CatalogueUpsertResponse:
+    """Register or refresh item metadata (economics → newsvendor service level).
+
+    This is how a backend syncs its full product menu to the model, before or
+    alongside posting sales history. Registering an item never trains anything: it just
+    makes the SKU known for /model/status and lets forecasts be asked for it once the
+    item's own history crosses the training threshold.
+    """
+    service = _service()
+    for item in req.items:
+        service.register_item(
+            item.sku,
+            unit_price=item.unit_price,
+            unit_cost=item.unit_cost,
+            shelf_life_days=item.shelf_life_days,
+            name_ar=item.name_ar,
+            name_en=item.name_en,
+            category=item.category,
+        )
+    return schemas.CatalogueUpsertResponse(
+        registered=service.catalogue.skus(),
+        count=len(service.catalogue),
+    )
 
 
 # -- forecasting ---------------------------------------------------------------------
@@ -382,7 +414,8 @@ def surplus_detect(req: schemas.SurplusRequest) -> schemas.SurplusResponse:
             daily_forecast[sku] = 0.0
 
     items = detect_surplus(
-        stock=req.stock, daily_forecast=daily_forecast, now=now, close_hour=req.close_hour
+        stock=req.stock, daily_forecast=daily_forecast, now=now, close_hour=req.close_hour,
+        catalogue=service.catalogue,
     )
     return schemas.SurplusResponse(
         checked_at=now,
@@ -411,8 +444,10 @@ def generate_offer(req: schemas.OfferRequest) -> schemas.OfferResponse:
     `generator` field reports which one actually produced the text.
     """
     offers: OfferService = STATE["offers"]
+    service = _service()
     try:
-        offer = offers.build(req.sku, req.discount_pct, req.close_time)
+        offer = offers.build(req.sku, req.discount_pct, req.close_time,
+                             catalogue=service.catalogue)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     return schemas.OfferResponse(**offer.__dict__)

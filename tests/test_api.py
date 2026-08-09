@@ -43,7 +43,10 @@ def test_daily_forecast_shape(client):
 
 def test_unknown_sku_is_rejected(client):
     r = client.post("/forecast/daily", json={"sku": "NOT_A_THING", "date": NORMAL_DAY})
-    assert r.status_code == 422
+    # The catalogue is dynamic (built from uploaded data), so an unknown SKU is a 404
+    # with an explanatory hint, not a schema-level 422.
+    assert r.status_code == 404
+    assert "NOT_A_THING" in r.json()["detail"]
 
 
 def test_ramadan_suppresses_croissant_forecast(client):
@@ -222,7 +225,7 @@ def test_daily_batch_matches_single_endpoint(client):
 
 def test_daily_batch_rejects_unknown_sku(client):
     r = client.post("/forecast/daily-batch", json={"date": NORMAL_DAY, "skus": ["NOPE"]})
-    assert r.status_code == 422
+    assert r.status_code == 404   # dynamic catalogue: unknown SKU -> not found
 
 
 def test_weekly_batch_returns_seven_days_per_item(client):

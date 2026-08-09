@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from typing import Mapping
 
 from app.core.items import BY_SKU, Item
 
@@ -66,6 +67,7 @@ def detect_surplus(
     now: dt.datetime,
     close_hour: int = DEFAULT_CLOSE_HOUR,
     min_risk: float = 0.15,
+    catalogue: Mapping[str, Item] | None = None,
 ) -> list[SurplusItem]:
     """Find items at genuine risk of going to waste tonight.
 
@@ -73,14 +75,18 @@ def detect_surplus(
     by how perishable the item is. A long shelf life is not an emergency: 20 leftover
     petit fours keep for two weeks and should not trigger a discount, while 20 leftover
     baladi loaves are worthless tomorrow morning.
+
+    Item economics come from `catalogue` when given (the runtime's dynamic item
+    registry); otherwise the synthetic fixtures in `BY_SKU` are used, so the demo and
+    tests keep working unchanged.
     """
     hours_left = max(0.0, close_hour - (now.hour + now.minute / 60))
     results: list[SurplusItem] = []
 
     for sku, current in stock.items():
-        if sku not in BY_SKU or current <= 0:
+        item: Item | None = catalogue.get(sku) if catalogue is not None else BY_SKU.get(sku)
+        if item is None or current <= 0:
             continue
-        item: Item = BY_SKU[sku]
         day_forecast = float(daily_forecast.get(sku, 0.0))
 
         # How much of today's demand is still to come?
