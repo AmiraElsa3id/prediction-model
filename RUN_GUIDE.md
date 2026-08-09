@@ -55,7 +55,7 @@ python3 -m venv .venv
 - لتغيير البورت: `--port 8200`.
 - متغيّرات بيئة اختيارية:
   - `COLD_START=true` → يبدأ بدون أي بيانات (كله rule-based) — لعرض سيناريو مخبز جديد.
-  - `REGISTRY_STORE=data/registry_state.pkl` → يحفظ ما تعلّمه لكل مطعم بعد الريستارت.
+  - `REGISTRY_STORE=data/registry.json` → يحفظ ما تعلّمه لكل مطعم بعد الريستارت.
 
 ### ب) توليد الداتا المحاكاة من جديد
 
@@ -115,7 +115,7 @@ model/
 │   │   └── connect_restomind.py  ← ⭐ الوصلة الحية: Mongo → الموديل → predictions
 │   └── api/
 │       ├── schemas.py            ← نماذج الإدخال/الإخراج (Pydantic)
-│       └── main.py               ← تطبيق FastAPI (16 endpoint) + CORS
+│       └── main.py               ← تطبيق FastAPI (16 endpoint) + API key + rate limit
 ├── scripts/
 │   ├── run_backtest.py           ← مقارنة الموديلات
 │   └── run_simulation.py         ← محاكاة التوفير بالجنيه

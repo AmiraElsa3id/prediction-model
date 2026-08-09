@@ -236,22 +236,27 @@ def test_weekly_batch_returns_seven_days_per_item(client):
         assert item["total_quantity"] == sum(d["recommended_quantity"] for d in item["days"])
 
 
-# -- integration auth -----------------------------------------------------------------
+# -- API key auth ----------------------------------------------------------------------
+# docs/01-api-key-hardening.md: every route except /health requires X-API-Key once
+# REQUIRE_API_KEY or API_KEY_HASH is set. auth.py reads its config at import time (so a
+# misconfigured deploy fails at boot, not at the first request -- docs §2.4/§4), so tests
+# that need the key enforced set the module's attributes directly via monkeypatch.setattr
+# rather than the env vars, and rely on monkeypatch to restore them after each test.
+
+import hashlib
+
+from app.api import auth
+
+TEST_KEY = "s3cret"
+TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
 
 
-def test_integration_routes_require_the_shared_secret(monkeypatch, client):
+def test_protected_routes_require_the_api_key(monkeypatch, client):
     """Anyone who can reach the port must not be able to poison another tenant's
-    learned demand levels via /integration/restomind/* without the shared secret.
-
-    The guard reads AI_SHARED_SECRET per request, not at app construction, so this
-    reuses the module-level `app`/`client` fixture instead of reloading the module --
-    reloading would reconstruct the shared FastAPI app singleton, which this suite
-    already knows is ordering-sensitive (see Task 3's deferred-minor note about a test
-    that re-runs the app's lifespan and mutates global registry state). monkeypatch
-    also guarantees AI_SHARED_SECRET is unset again after this test regardless of
-    whether the assertions below pass or fail, so nothing leaks into later tests.
+    learned demand levels, or use any other route, without the API key.
     """
-    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+    monkeypatch.setattr(auth, "REQUIRE_API_KEY", True)
+    monkeypatch.setattr(auth, "API_KEY_HASH", TEST_KEY_HASH)
 
     payload = {"restaurantId": "R1", "productId": "p1", "title": "X",
                "targetWeek": "2025-03-09", "avgDailySales": 10}
@@ -259,34 +264,102 @@ def test_integration_routes_require_the_shared_secret(monkeypatch, client):
     unauthenticated = client.post("/integration/restomind/predict", json=payload)
     assert unauthenticated.status_code == 401
 
+    wrong_key = client.post("/integration/restomind/predict", json=payload,
+                            headers={"X-API-Key": "not-the-key"})
+    assert wrong_key.status_code == 401
+
     ok = client.post("/integration/restomind/predict", json=payload,
-                     headers={"X-RestoMind-Key": "s3cret"})
+                     headers={"X-API-Key": TEST_KEY})
     assert ok.status_code == 200
 
-    # Non-integration routes stay open.
+    # A non-integration route is protected too -- not just the old RestoMind-only scope.
+    forecast_unauthenticated = client.post(
+        "/forecast/daily", json={"sku": "PASTRY_CROISSANT", "date": NORMAL_DAY}
+    )
+    assert forecast_unauthenticated.status_code == 401
+
+    # /health is the sole exemption.
     assert client.get("/health").status_code == 200
 
 
-def test_preflight_to_protected_route_still_gets_cors_headers(monkeypatch, client):
-    """CORSMiddleware must be the outermost layer, not wrapped by the secret guard.
-
-    Starlette builds the middleware stack so the LAST-registered middleware becomes
-    OUTERMOST. If the secret guard is registered after CORSMiddleware (as a naive
-    reading of "insert immediately after the CORSMiddleware block" would do), the
-    guard runs first and can short-circuit an OPTIONS preflight with a 401 before
-    CORSMiddleware ever gets a chance to attach Access-Control-Allow-* headers --
-    which makes every cross-origin browser call to a protected route fail at
-    preflight, correct secret or not, since the browser never gets to see the 401
-    body or retry with credentials for a request CORS itself rejected.
+def test_refuses_to_boot_without_a_key_hash_when_required(monkeypatch):
+    """A deploy that sets REQUIRE_API_KEY=true but forgets API_KEY_HASH must fail loudly
+    at import/startup time, not silently serve every route as unauthenticated.
     """
-    monkeypatch.setenv("AI_SHARED_SECRET", "s3cret")
+    import importlib
 
-    preflight = client.options(
-        "/integration/restomind/predict",
-        headers={
-            "Origin": "http://localhost:3000",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type",
-        },
-    )
-    assert "access-control-allow-origin" in {k.lower() for k in preflight.headers.keys()}
+    monkeypatch.setenv("REQUIRE_API_KEY", "true")
+    monkeypatch.delenv("API_KEY_HASH", raising=False)
+    try:
+        with pytest.raises(RuntimeError):
+            importlib.reload(auth)
+    finally:
+        # Restore the module to its normal (dev-mode) state so later tests -- which
+        # import `auth` as the same shared module object `main.py` already holds a
+        # reference to -- are unaffected by this test having reloaded it.
+        monkeypatch.setenv("REQUIRE_API_KEY", "false")
+        monkeypatch.delenv("API_KEY_HASH", raising=False)
+        importlib.reload(auth)
+
+
+# -- rate limiting -----------------------------------------------------------------------
+# docs/03-cors-and-rate-limiting.md: a blunt cost guard, not per-user fairness -- there is
+# exactly one legitimate caller (the backend), so this exists to cap the worst case (a
+# retry loop, a leaked key) rather than to be fair to individual end users. Tests reset
+# the shared in-memory counter and lower the limits via monkeypatch so they run fast and
+# don't leak tripped state into other tests sharing this process.
+
+from app.api import ratelimit
+
+
+def test_default_tier_rate_limit_returns_429_with_retry_after(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 3)
+
+    for _ in range(3):
+        assert client.get("/model/status").status_code == 200
+
+    limited = client.get("/model/status")
+    assert limited.status_code == 429
+    assert "retry-after" in {k.lower() for k in limited.headers.keys()}
+    assert limited.json()["error"] == "rate_limited"
+
+
+def test_marketing_tier_has_its_own_tighter_budget(monkeypatch, client):
+    """The marketing tier's limit is tracked separately from the default tier, so heavy
+    (legitimate) forecast traffic can't starve it, and vice versa.
+    """
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "MARKETING_LIMIT_PER_MIN", 2)
+
+    payload = {"sku": "CAKE_GATEAU", "discount_pct": 30}
+    for _ in range(2):
+        assert client.post("/marketing/generate-offer", json=payload).status_code == 200
+
+    limited = client.post("/marketing/generate-offer", json=payload)
+    assert limited.status_code == 429
+
+    # A different tier's budget is untouched by marketing's limit being tripped.
+    assert client.get("/model/status").status_code == 200
+
+
+def test_health_stays_exempt_from_rate_limiting(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 1)
+
+    for _ in range(5):
+        assert client.get("/health").status_code == 200
+
+
+def test_rate_limit_resets_after_the_window_elapses(monkeypatch, client):
+    monkeypatch.setattr(ratelimit, "_COUNTERS", {})
+    monkeypatch.setattr(ratelimit, "DEFAULT_LIMIT_PER_MIN", 1)
+
+    fake_now = [1_000.0]
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: fake_now[0])
+
+    assert client.get("/model/status").status_code == 200
+    assert client.get("/model/status").status_code == 429
+
+    fake_now[0] += ratelimit.WINDOW_SECONDS + 1
+    assert client.get("/model/status").status_code == 200

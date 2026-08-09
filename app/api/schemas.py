@@ -480,6 +480,13 @@ class RMRegistryStatusResponse(BaseModel):
     restaurantId: str
     productsTracked: int
     usingLearnedLevel: int
+    # This service owns the threshold, so it reports it rather than leaving the
+    # caller to restate it. RestoMind renders a per-product progress bar from
+    # observedDays/minDaysForLearned; when it hardcoded the number instead, a
+    # tuning change here silently made that bar wrong.
+    minDaysForLearned: int
+    quietWindowDays: int
+    confidentDays: int
     items: list[dict]
 
 

@@ -334,5 +334,10 @@ class RestaurantRegistry:
             "restaurantId": restaurant_id,
             "productsTracked": len(items),
             "usingLearnedLevel": sum(1 for i in items if i["levelSource"] == "learned_from_sales"),
+            # Reported, not assumed by the caller: these thresholds belong to this
+            # module, and RestoMind's progress bar is derived from them.
+            "minDaysForLearned": MIN_DAYS_FOR_LEARNED,
+            "quietWindowDays": QUIET_WINDOW,
+            "confidentDays": CONFIDENT_DAYS,
             "items": items,
         }

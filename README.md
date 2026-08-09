@@ -119,7 +119,14 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` | free-tier LLM for Arabic copy (Groq/Gemini/OpenRouter). Without it, templates are used. |
 | `META_PAGE_ID`, `META_ACCESS_TOKEN`, `META_PUBLISH_ENABLED` | live Meta publishing. All three required; otherwise `/marketing/publish` returns a preview. |
 | `COLD_START` | `true` starts with zero history (fully rule-based) for the cold-start demo. Default trains on the full simulated dataset. |
-| `CORS_ORIGINS` | comma-separated frontend origins allowed to call the API. Default `http://localhost:3000`; set explicitly for other deployments. |
+| `REQUIRE_API_KEY`, `API_KEY_HASH` | API key auth for every route except `/health` (see `docs/01-api-key-hardening.md`). Unset in local dev, auth is skipped. `API_KEY_HASH` is the SHA-256 hex digest of the real key, not the key itself — the raw key lives only on the caller's side. Callers send it as `X-API-Key`. Rotation is manual only for now. |
+
+No `CORS_ORIGINS`: this service is never called from a browser directly, only the
+backend calls it server-to-server, so there's no CORS layer to configure
+(`docs/03-cors-and-rate-limiting.md` §2.1). Every route except `/health` also sits
+behind a blunt, always-on cost-guard rate limit (not a real per-user limiter — see
+`docs/03` §1.2 for why); its thresholds are constants in `app/api/ratelimit.py`, tighter
+on `/marketing/*` than on the cheap forecast/surplus routes.
 
 ## What's needed to move beyond the POC
 
