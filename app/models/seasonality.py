@@ -44,12 +44,80 @@ RIDGE_ALPHA = 1.0
 # Multipliers outside this range are almost certainly artefacts of a tiny sample.
 MIN_MULTIPLIER, MAX_MULTIPLIER = 0.05, 25.0
 
+# Human labels for the design matrix's columns. Several columns share a label on
+# purpose (the two kahk ramp terms are one driver to a reader, as are the six weekday
+# dummies); `attribute` sums their contributions before reporting.
+FACTOR_LABELS = {
+    "ramadan_early": "Ramadan (first third)",
+    "ramadan_mid": "Ramadan (middle)",
+    "ramadan_late": "Ramadan (last third)",
+    "eid_fitr": "Eid al-Fitr",
+    "eid_adha": "Eid al-Adha",
+    "kahk_ramp": "Kahk season",
+    "kahk_ramp_sq": "Kahk season",
+    "is_sham_el_nessim": "Sham El-Nessim",
+    "is_coptic_christmas": "Coptic Christmas",
+    "is_public_holiday": "Public holiday",
+    "is_school_term": "School term",
+    "is_payday_window": "Payday period",
+    **{f"dow_{d}": "Day of week" for d in range(1, 7)},
+}
+
+# Drivers moving the number by less than this are noise to a manager reading the screen.
+MIN_REPORTABLE_EFFECT = 0.02
+
+
+def attribute(columns: list[str], coefficients, X_row: pd.DataFrame) -> list[dict]:
+    """Attribute one row's multiplier to individual calendar drivers.
+
+    Because the fit is linear in log space, each active term's contribution is exactly
+    `exp(coefficient x value)` -- a decomposition, not an approximation. Shared by the
+    trained per-SKU model (`CalendarEffects.explain`) and the per-restaurant fit in
+    `app.integration.tenant_calendar`, so both screens explain a number the same way.
+
+    Effects are relative to the fit's reference day: a Monday outside Ramadan and any
+    holiday (see `design_matrix` for why Monday). That is the same convention the trained
+    path reports, so a "Day of week" factor always means "compared with a Monday".
+    """
+    contributions: dict[str, float] = {}
+    for col, coef in zip(columns, coefficients):
+        value = float(X_row.iloc[0][col])
+        if value == 0.0:
+            continue
+        label = FACTOR_LABELS.get(col, col)
+        contributions[label] = contributions.get(label, 0.0) + float(coef) * value
+
+    factors = []
+    for label, log_effect in contributions.items():
+        change = float(np.exp(log_effect) - 1.0)
+        if abs(change) >= MIN_REPORTABLE_EFFECT:
+            factors.append({
+                "factor": label,
+                "impact_pct": round(change * 100, 1),
+                "direction": "increase" if change > 0 else "decrease",
+            })
+
+    return sorted(factors, key=lambda f: abs(f["impact_pct"]), reverse=True)
+
+
+def align(X: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Force a design matrix onto `columns`, filling anything absent with zero.
+
+    Guards against a frame built from a different feature set than the fit saw.
+    """
+    for col in columns:
+        if col not in X.columns:
+            X[col] = 0.0
+    return X[columns]
+
 
 def design_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """Calendar-only design matrix. Deliberately contains no history features."""
     X = pd.DataFrame(index=df.index)
 
-    # Weekday as dummies; Sunday (0 in Egypt's working week terms) is the reference.
+    # Weekday as dummies. `day_of_week` is Monday-zero (Friday 4, Saturday 5 -- Egypt's
+    # weekend), so omitting index 0 makes MONDAY the reference level, and every reported
+    # weekday effect is a deviation from a Monday. An earlier comment here claimed Sunday.
     for d in range(1, 7):
         X[f"dow_{d}"] = (df["day_of_week"] == d).astype(float)
 
@@ -123,12 +191,7 @@ class CalendarEffects:
 
     def multiplier(self, df: pd.DataFrame) -> np.ndarray:
         """Calendar multiplier for each row. Unknown SKUs get a neutral 1.0."""
-        X = design_matrix(df)
-        # Guard against a frame built with a different feature set.
-        for col in self.columns:
-            if col not in X.columns:
-                X[col] = 0.0
-        X = X[self.columns]
+        X = align(design_matrix(df), self.columns)
 
         out = np.ones(len(df), dtype=float)
         skus = df["sku"].to_numpy()
@@ -142,53 +205,10 @@ class CalendarEffects:
     def explain(self, df_row: pd.DataFrame) -> list[dict]:
         """Attribute a single date's multiplier to individual calendar drivers.
 
-        Because the fit is linear in log space, each active term's contribution is just
-        exp(coefficient) -- an exact decomposition, not an approximation. This is the
-        attribution the combined model could not produce.
+        This is the attribution the combined model could not produce. The arithmetic
+        lives in `attribute` so the per-restaurant fit explains itself identically.
         """
-        sku = df_row.iloc[0]["sku"]
-        model = self.models.get(sku)
+        model = self.models.get(df_row.iloc[0]["sku"])
         if model is None:
             return []
-
-        X = design_matrix(df_row)
-        for col in self.columns:
-            if col not in X.columns:
-                X[col] = 0.0
-        X = X[self.columns]
-
-        labels = {
-            "ramadan_early": "Ramadan (first third)",
-            "ramadan_mid": "Ramadan (middle)",
-            "ramadan_late": "Ramadan (last third)",
-            "eid_fitr": "Eid al-Fitr",
-            "eid_adha": "Eid al-Adha",
-            "kahk_ramp": "Kahk season",
-            "kahk_ramp_sq": "Kahk season",
-            "is_sham_el_nessim": "Sham El-Nessim",
-            "is_coptic_christmas": "Coptic Christmas",
-            "is_public_holiday": "Public holiday",
-            "is_school_term": "School term",
-            "is_payday_window": "Payday period",
-            **{f"dow_{d}": "Day of week" for d in range(1, 7)},
-        }
-
-        contributions: dict[str, float] = {}
-        for col, coef in zip(self.columns, model.coef_):
-            value = float(X.iloc[0][col])
-            if value == 0.0:
-                continue
-            label = labels.get(col, col)
-            contributions[label] = contributions.get(label, 0.0) + coef * value
-
-        factors = []
-        for label, log_effect in contributions.items():
-            change = float(np.exp(log_effect) - 1.0)
-            if abs(change) >= 0.02:
-                factors.append({
-                    "factor": label,
-                    "impact_pct": round(change * 100, 1),
-                    "direction": "increase" if change > 0 else "decrease",
-                })
-
-        return sorted(factors, key=lambda f: abs(f["impact_pct"]), reverse=True)
+        return attribute(self.columns, model.coef_, align(design_matrix(df_row), self.columns))

@@ -58,7 +58,7 @@ back to 300/20/60 -- not a real per-user limiter, just a ceiling against runaway
 No `CORS_ORIGINS` anymore -- this service is never called from a browser directly, so
 CORSMiddleware was removed (`docs/03` §2.1) rather than configured.
 
-**Status: 107 tests passing.** Do not mark work done unless tests pass.
+**Status: 124 tests passing.** Do not mark work done unless tests pass.
 
 ---
 
@@ -74,8 +74,10 @@ app/
     generate.py         Synthetic POS+inventory generator (2 yrs) with KNOWN injected effects
                         + a "manager guesses" production policy (creates the waste baseline).
     features.py         Cleaning (reconcile stock, closed-vs-zero, outlier flag that spares
-                        calendar spikes), lag/rolling/calendar features, censored-demand mask,
-                        clean_baseline (event-free baseline for multiplier fitting).
+                        calendar spikes — INCLUDING the weekend, whose omission used to make
+                        the filter delete every Fri/Sat of a strong weekly pattern and flatten
+                        the fitted profile), lag/rolling/calendar features, censored-demand
+                        mask, clean_baseline (event-free baseline for multiplier fitting).
 evaluation.py       WAPE/MASE/pinball/bias + rolling-origin backtest + per-item scores.
     surplus.py          Near-closing surplus detection + discount tiers + sell-through curve.
   models/
@@ -93,14 +95,22 @@ evaluation.py       WAPE/MASE/pinball/bias + rolling-origin backtest + per-item 
     registry.py         MULTI-TENANT per-restaurant state. Stores each restaurant's sales
                         separately and learns real demand LEVEL per product from ingested
                         data, so seeding sales actually moves predictions (proven by test).
+    tenant_calendar.py  Per-restaurant calendar effects for products OUTSIDE the trained
+                        catalogue: same CalendarEffects fit, keyed by productId, normalised
+                        so level x multiplier == level on an ordinary day. This is what
+                        makes the bridge answer per DATE instead of one flat number.
   api/
     schemas.py          All Pydantic request/response models.
     main.py             FastAPI app, 16 route decorators, CORS, lifespan (trains on startup).
 scripts/
     run_backtest.py     Model comparison (all models, both horizons).
     run_simulation.py   Business simulation -> EGP saved vs the manager baseline.
+    refit_tenant_calendars.py  One-off: fits calendars for restaurant state written before
+                        tenant_calendar.py existed, by replaying its own stored history.
+                        Levels are unchanged; without it those restaurants stay flat until
+                        their next /ingest.
 dashboard.py            Streamlit investor demo (4 tabs).
-tests/                  107 tests across 9 files (see §6).
+tests/                  124 tests across 10 files (see §6).
 data/
     synthetic_pos.parquet   generated dataset
     models/                 pickled models (if saved)
@@ -196,11 +206,13 @@ Alerts/surplus: `POST /alerts/waste-prevention`, `/surplus/detect`,
 Every forecast response carries `confidence`, `source` (batch), interval, and `factors`
 (calendar attribution) — the explanation is what makes managers trust it.
 
-Tests (**117 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
+Tests (**124 total**): `test_egypt_calendar` (calendar dates vs known values), `test_generate`
 (effect recovery), `test_forecaster` (decomposition anticipates Ramadan, beats naive),
 `test_hybrid` (threshold gate: no forecast while training, then model), `test_api` (all
 endpoints), `test_restomind_bridge` (basis-level bridge + timezone), `test_registry`
-(seeding sales changes predictions + per-tenant isolation). Postman: 17 requests,
+(seeding sales changes predictions + per-tenant isolation), `test_tenant_calendar` (a
+learned level lands on the DATE asked for, and stays flat when nothing was learned).
+Postman: 17 requests,
 run via `npx newman run postman_collection.json --env-var "baseUrl=http://127.0.0.1:PORT"`.
 
 ---
@@ -287,13 +299,24 @@ moderate effort. City/weather = optional. Hyper-local = learned from data automa
 2. **Live RestoMind wiring** — boot their NestJS + MongoDB, connect to this service, test
    end-to-end. Needs their env/DB. Optionally build a connector that reads
    `sales_transactions` and feeds `/data/ingest` so seeding real data actually moves the model.
-3. **Multi-tenant model registry** — PARTIALLY DONE: `integration/registry.py` keys
+3. **Multi-tenant model registry** — MOSTLY DONE: `integration/registry.py` keys
    state by `restaurantId` and learns the per-product demand LEVEL from ingested sales.
-   The trained `CalendarDecomposed` model is now routed into the RestoMind screens too:
+   The trained `CalendarDecomposed` model is routed into the RestoMind screens too:
    a product carrying a catalogue `sku` is forecast by the trained model in
    `/integration/restomind/production-plan` and `/integration/restomind/predict`.
-   Remaining: generalised per-restaurant economics so arbitrary (non-catalogue) products
-   get a trained forecast of their own, not only the 11 built-in SKUs.
+   Arbitrary (non-catalogue) products now also get per-restaurant CALENDAR effects, not
+   just a level — `integration/tenant_calendar.py` fits the same ridge-in-log-space model
+   as the trained path (`models/seasonality.CalendarEffects`) to the restaurant's own
+   history, keyed by `productId`. Until that existed, the plan multiplied nothing: a
+   learned level is a quiet-day mean, so `/production-plan` returned one identical
+   quantity for every date of the year while `/forecast/daily-batch` moved with the
+   calendar on the same sales — same data, two answers, and the plan is the one that
+   decides how much gets baked.
+   Remaining: the per-restaurant fit learns *shape* only. A product's LEVEL is still a
+   flat mean rather than a booster tracking drift, so there is no per-restaurant
+   equivalent of the trained path's `LightGBMQuantile` level model or its calibrated
+   prediction interval (the bounds stay the fixed ±10% band). That is the last gap
+   between a catalogue SKU and an arbitrary restaurant product.
 4. **Ingredient-level forecasting** — use `Recipe` (bill of materials) to convert product
    demand → ingredient purchasing forecast; use `freshnessWindow`/`shelfLifeDays` instead of
    hardcoded shelf life. Unlocks à-la-carte restaurants (waste is at ingredient level).

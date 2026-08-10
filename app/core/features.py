@@ -92,6 +92,16 @@ def flag_outliers(df: pd.DataFrame, target: str = "sales_qty") -> pd.DataFrame:
     A 40x jump in kahk sales the day before Eid is the single most important signal in
     the dataset. A naive outlier filter would erase exactly the peaks we are paid to
     predict, so any day carrying a calendar event is exempt from flagging.
+
+    THE WEEKEND IS ONE OF THOSE EVENTS. It was missing from this list, and on a business
+    with a strong, low-noise weekly pattern that is fatal rather than cosmetic: the
+    rolling median over a 5-weekday / 2-weekend mix sits at the weekday level, so a
+    genuine Friday uplift reads as a 10-MAD deviation and EVERY Friday and Saturday gets
+    flagged. Measured on a restaurant selling 100/day midweek and 180/day at the weekend,
+    all 62 weekend days in seven months were dropped, `CalendarEffects` never saw one,
+    and the fitted weekday profile came out flat -- the model concluding the weekend does
+    not exist because the weekend was too consistent. A recurring weekly pattern is the
+    most predictable thing in this data; it is never an anomaly.
     """
     df = df.copy()
     df["is_outlier"] = 0
@@ -101,6 +111,7 @@ def flag_outliers(df: pd.DataFrame, target: str = "sales_qty") -> pd.DataFrame:
         | (df.get("is_ramadan", 0) == 1)
         | (df.get("is_kahk_window", 0) == 1)
         | (df.get("is_sham_el_nessim", 0) == 1)
+        | (df.get("is_weekend", 0) == 1)
     )
 
     for sku, grp in df.groupby("sku", sort=False):

@@ -12,6 +12,7 @@ registry -- noted in the plan, deliberately out of scope here.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ from app.integration.registry import RestaurantRegistry
 from app.models.service import ForecastService, ModelNotReadyError
 
 STATE: dict = {}
+LOG = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -521,8 +523,13 @@ def rm_production_plan(req: schemas.RMProductionPlanRequest) -> schemas.RMProduc
     registry.upsert_products(req.restaurantId, products)
     state = registry.get(req.restaurantId)
     levels = state.levels_for(p.product_id for p in products)
+    # `state.calendar` is what makes this endpoint answer per DATE. Without it the plan
+    # returned one flat learned level for every day of the year -- a Tuesday, a Friday
+    # and a day in Ramadan all got the same quantity, while /forecast/daily-batch (the
+    # trained path) moved with the calendar on the same underlying sales.
     plan = restomind.production_plan(
-        req.restaurantId, products, req.date, levels=levels, model=_trained_model()
+        req.restaurantId, products, req.date, levels=levels, model=_trained_model(),
+        calendar=state.calendar,
     )
     return schemas.RMProductionPlanResponse(
         restaurantId=req.restaurantId,
@@ -570,7 +577,8 @@ def rm_surplus_offers(req: schemas.RMSurplusRequest) -> schemas.RMSurplusRespons
     state = registry.get(req.restaurantId)
     levels = state.levels_for(s.product_id for s in stock)
     items = restomind.surplus_offers(
-        req.restaurantId, stock, now, close_hour=req.closeHour, levels=levels
+        req.restaurantId, stock, now, close_hour=req.closeHour, levels=levels,
+        calendar=state.calendar,
     )
     return schemas.RMSurplusResponse(
         restaurantId=req.restaurantId,
@@ -595,6 +603,8 @@ def rm_predict(req: schemas.RMPredictRequest) -> schemas.RMPredictResponse:
     produces the week. A product with no basis gets `predictedOrders: 0` with a
     `trainingMessage` -- still training, not a guess.
     """
+    LOG.info("RestoMind predict request body: %s", req.model_dump_json())
+
     product = restomind.ProductInput(
         product_id=req.productId, title=req.title, category=req.category,
         avg_daily_sales=req.avgDailySales, sku=req.sku,
@@ -635,7 +645,7 @@ def rm_ingest(req: schemas.RMIngestRequest) -> schemas.RMIngestResponse:
         restomind.ProductInput(
             product_id=p.productId, title=p.title, category=p.category,
             price=p.price, unit_cost=p.unitCost, freshness_window=p.freshnessWindow,
-            avg_daily_sales=p.avgDailySales,
+            avg_daily_sales=p.avgDailySales, sku=p.sku,
             avg_daily_sales_window=_window(p.avgDailySalesWindow),
         )
         for p in (req.products or [])

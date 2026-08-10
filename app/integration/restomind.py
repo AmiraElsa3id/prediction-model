@@ -12,6 +12,13 @@ priors. It forecasts from a **basis daily level** only:
     (best - it came from actual history), or
   * the owner's `avgDailySales` estimate.
 
+That level is a quiet-day mean with seasonality deliberately left out, so on its own it
+answers every date with the same number -- which is what the production plan did for
+every product outside the trained catalogue. A learned level now carries a learned
+calendar with it (`tenant_calendar.TenantCalendar`, fitted from the same restaurant's
+history) and the plan multiplies the two. An owner estimate has no history behind it and
+therefore no calendar: it stays flat, because the alternative is guessing.
+
 A product with neither has no forecast at all: the bridge answers with a "still
 training" message so the caller can plan around the absence instead of trusting a guess.
 
@@ -41,6 +48,7 @@ from app.core.surplus import expected_sell_through
 from app.models.service import ModelNotReadyError
 
 if TYPE_CHECKING:
+    from app.integration.tenant_calendar import TenantCalendar
     from app.models.service import ForecastService
 
 # Every wall-clock quantity this bridge reasons about -- `close_hour`, the
@@ -51,7 +59,10 @@ BUSINESS_TIMEZONE = ZoneInfo("Africa/Cairo")
 # results stay auditable and comparable across versions (maps to RestoMind's
 # prediction.modelVersionId). Used for the basis-level fallback path; the trained path
 # stamps `calendar_decomposed/{source}` instead.
-MODEL_VERSION = "restomind-bridge/basis-v0.1"
+#
+# v0.2: a learned level is multiplied by the restaurant's own learned calendar, so the
+# same product no longer gets one number for every date of the year.
+MODEL_VERSION = "restomind-bridge/basis-v0.2"
 
 # Output margin when the bridge CAN forecast: a fixed band around the basis level.
 # There is no trained interval on this path (that needs the trained model), so the
@@ -94,8 +105,14 @@ def _newsvendor_quantile(
     a restaurant's own `unitCost`/`price`/`freshnessWindow` instead of the hardcoded
     11-item catalogue -- replacing that placeholder is the whole point of asking
     RestoMind for real unit economics.
+
+    A cost of ZERO is treated as unknown, not as free. Arithmetically a zero cost means
+    zero overage cost, so q* is exactly 1.0 and every such product is planned at its
+    upper bound -- a permanent, invisible +10% on quantity. Backends that fill unset
+    numeric columns with 0 (RestoMind's registry is full of `unitCost: 0` against real
+    prices) were getting that silently. Nothing in a bakery costs nothing to make.
     """
-    if unit_cost is None or price <= 0:
+    if unit_cost is None or unit_cost <= 0 or price <= 0:
         return None
     margin = price - unit_cost
     if margin <= 0:
@@ -201,23 +218,25 @@ def basis_level(p: ProductInput, level: float | None = None) -> float | None:
     return None
 
 
-def _forecast_one(
-    p: "ProductInput", level: float | None = None,
-) -> tuple[float | None, list[dict]]:
-    """Basis-level point estimate for one product on one day.
+def _calendar_for(
+    calendar: "TenantCalendar | None", product_id: str, day: dt.date,
+) -> tuple[float, list[dict]]:
+    """`(multiplier, factors)` for one product on one day, or a neutral `(1.0, [])`.
 
-    Shared by the daily production plan and the weekly prediction so both always
-    agree. Returns `(None, [])` when no basis exists -- the caller must report that
-    product as still training, not invent a number.
+    Shared by the production plan, the weekly prediction and the surplus scan so the
+    three screens cannot disagree about what today does to demand. A product the
+    restaurant has not yet earned a calendar for gets exactly the old flat behaviour.
     """
-    base = basis_level(p, level)
-    return base, []
+    if calendar is None or product_id not in calendar:
+        return 1.0, []
+    return calendar.multiplier(product_id, day), calendar.explain(product_id, day)
 
 
 def production_plan(
     restaurant_id: str, products: list[ProductInput], target_date: dt.date,
     levels: dict[str, tuple[float | None, str, str]] | None = None,
     model: "ForecastService | None" = None,
+    calendar: "TenantCalendar | None" = None,
 ) -> list[dict]:
     """Per-product production recommendation for a restaurant on a date.
 
@@ -233,6 +252,12 @@ def production_plan(
     basis-level behaviour below. Passing no model (or a product with no SKU) is
     unchanged behaviour, so tests and callers that only use the stateless bridge are
     unaffected.
+
+    `calendar`, when given, is the restaurant's OWN learned calendar (see
+    `tenant_calendar`). It moves the basis level onto `target_date` for products that
+    have enough history to have earned one, which is what stops this endpoint answering
+    every date of the year with a single number. Products on the owner's estimate are
+    not in it and stay flat.
     """
     levels = levels or {}
     out: list[dict] = []
@@ -275,8 +300,14 @@ def production_plan(
             })
             continue
 
-        lower = max(base * BASIS_QUANTUM_LOW, 0)
-        upper = max(base * BASIS_QUANTUM_HIGH, 0)
+        # The level is an ORDINARY-day figure by construction. This is what puts the
+        # target date back into it -- without it `target_date` never entered the
+        # arithmetic at all and the plan was the same on a Tuesday and in Ramadan.
+        multiplier, factors = _calendar_for(calendar, p.product_id, target_date)
+        planned = base * multiplier
+
+        lower = max(planned * BASIS_QUANTUM_LOW, 0)
+        upper = max(planned * BASIS_QUANTUM_HIGH, 0)
         # With real unit_cost + price, pick the profit-optimal point within the
         # uncertainty band instead of always the raw point estimate: a thin-margin,
         # short-shelf-life product (q* low) should be produced nearer the lower bound
@@ -285,7 +316,7 @@ def production_plan(
         # (`q is None` -> the point estimate, same as before this existed).
         severity = _spoilage_severity(p.freshness_window)
         q = _newsvendor_quantile(p.unit_cost, p.price, severity)
-        recommended = base if q is None else lower + q * (upper - lower)
+        recommended = planned if q is None else lower + q * (upper - lower)
         out.append({
             "productId": p.product_id,
             "title": p.title,
@@ -296,8 +327,11 @@ def production_plan(
             "confidence": confidence,
             "source": mode,
             "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
+            # The ORDINARY-day level, before the calendar. Reported separately from
+            # `calendarMultiplier` so a reader can see both halves of the quantity.
             "baseDailyLevel": round(float(base), 2),
-            "factors": [],
+            "calendarMultiplier": round(multiplier, 3),
+            "factors": factors,
             "trainingMessage": None,
         })
     return out
@@ -308,13 +342,15 @@ def predict_week(
     promotion_active: bool = False, level: float | None = None,
     mode: str = "training", confidence: str = "low",
     model: "ForecastService | None" = None,
+    calendar: "TenantCalendar | None" = None,
 ) -> dict:
     """Weekly prediction shaped for RestoMind's `predictions` collection.
 
     Mirrors their `prediction` document (`predictedOrders` for a `targetWeek`, plus a
-    `featuresUsed` snapshot for auditability). Forecast is the basis level repeated
-    across the week; the Egyptian calendar is reported in `featuresUsed.calendar` for
-    auditability but no longer multiplies the number (that was the removed rule layer).
+    `featuresUsed` snapshot for auditability). Forecast is the basis level shaped across
+    the week by the restaurant's own learned calendar when it has one (`calendar`);
+    without one the level repeats, as it did before -- an owner's estimate has no
+    history behind it to learn a weekday profile from.
 
     `model`, when given, upgrades a product carrying a trained catalogue `sku` link to
     the trained CalendarDecomposed model: seven calendar-aware per-day forecasts whose
@@ -360,9 +396,11 @@ def predict_week(
         }
 
     daily: list[dict] = []
+    strongest: dict[str, dict] = {}
     for i in range(7):
         d = week_start + dt.timedelta(days=i)
-        rounded = int(round(max(base, 0)))
+        multiplier, factors = _calendar_for(calendar, product.product_id, d)
+        rounded = int(round(max(base * multiplier, 0)))
         daily.append({
             "date": d.isoformat(),
             # `predictedQuantity` is the canonical name -- it matches RestoMind's
@@ -370,8 +408,13 @@ def predict_week(
             "predictedQuantity": rounded,
             # DEPRECATED alias, kept one release so existing clients do not break.
             "qty": rounded,
-            "factors": [],
+            "factors": factors,
         })
+        # The week's headline factors are each driver at its strongest day, matching
+        # how `_trained_week` summarises the trained path.
+        for f in factors:
+            if f["factor"] not in strongest or abs(f["impact_pct"]) > abs(strongest[f["factor"]]["impact_pct"]):
+                strongest[f["factor"]] = f
     # Sum the rounded daily values so the weekly total always reconciles with the breakdown.
     total = sum(day["predictedQuantity"] for day in daily)
 
@@ -381,6 +424,12 @@ def predict_week(
         "mode": mode,
         "baseDailyLevel": round(float(base), 2),
         "levelSource": "learned_from_sales" if level is not None else "owner_estimate",
+        # Whether the week has a shape at all, or is one number seven times.
+        "calendarSource": (
+            "learned_from_sales"
+            if calendar is not None and product.product_id in calendar
+            else "none"
+        ),
         "promotionActive": promotion_active,
         "calendar": _calendar_snapshot(week_start),
     }
@@ -394,7 +443,7 @@ def predict_week(
         "confidence": confidence,
         "trainingMessage": None,
         "featuresUsed": features_used,
-        "factors": [],
+        "factors": sorted(strongest.values(), key=lambda f: abs(f["impact_pct"]), reverse=True),
         "dailyBreakdown": daily,
     }
 
@@ -446,6 +495,7 @@ def to_business_time(now: dt.datetime) -> dt.datetime:
 def surplus_offers(
     restaurant_id: str, stock: list[StockInput], now: dt.datetime, close_hour: int = 22,
     levels: dict[str, tuple[float | None, str, str]] | None = None,
+    calendar: "TenantCalendar | None" = None,
 ) -> list[dict]:
     """Near-closing surplus per product, with a suggested discount.
 
@@ -457,6 +507,10 @@ def surplus_offers(
     which is what decides whether stock is at risk at all -- an owner estimate or
     learned level is the basis for expected sales. A product with no basis is skipped
     (no foundation to judge risk).
+
+    `calendar` shapes that basis onto today, same as the production plan: a Friday's
+    stock is judged against a Friday's demand. Flagging surplus against a flat weekday
+    average is how you end up discounting on the busiest day of the week.
     """
     levels = levels or {}
     # Normalise before ANY wall-clock read: `.hour`, `.minute` and `.date()` below
@@ -477,7 +531,8 @@ def surplus_offers(
         # `or` is a truthy test, so an honest 0.0 ("this product sells nothing")
         # must not be replaced by anything. `basis_level` keeps 0.0 distinct from a
         # missing value, and `base` is used exactly as given.
-        expected_remaining = base * remaining_share
+        multiplier, _ = _calendar_for(calendar, s.product_id, now.date())
+        expected_remaining = base * multiplier * remaining_share
 
         projected_surplus = max(0.0, s.current_stock - expected_remaining)
         raw_risk = projected_surplus / s.current_stock

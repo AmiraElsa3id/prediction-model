@@ -76,6 +76,13 @@ The RestoMind production-plan, predict, and surplus-offers routes also register 
 the product metadata they receive. When enough usable sales history exists, these routes
 use the learned per-restaurant level; until then they fall back to `avgDailySales`.
 
+Only step 1 makes those routes date-sensitive. A learned level is an *ordinary-day* figure
+by construction (its quiet-day sample excludes weekends and events), and the calendar that
+puts it back on a specific date is fitted during ingest. A product still on `avgDailySales`
+has no history to fit one from, so it returns the same quantity for every date — check
+`calendarMultiplier` in the plan, or `calendarAware` in the status response, rather than
+inferring it from the numbers.
+
 ## Endpoint reference
 
 | Method and path | What it does | Main result or side effect |
@@ -209,7 +216,11 @@ use the learned per-restaurant level; until then they fall back to `avgDailySale
 
 - **Request:** `{ "restaurantId", "records": [{ "date", "productId", "salesQty", "productionQty?", "closingStock?" }], "products?": [] }`.
 - **Processing:** converts RestoMind sales rows to a per-restaurant history, registers any
-  supplied products, saves the restaurant state, and re-learns ordinary-day product levels.
+  supplied products, saves the restaurant state, re-learns ordinary-day product levels, and
+  refits each learned product's calendar effects (weekday shape, and Ramadan/holiday shape
+  once the history has actually contained one) from that restaurant's own sales. Both are
+  recomputed from the whole history on every call, so this is the only endpoint that makes
+  a plan calendar-aware.
   Stockout days are excluded from the learned average when `closingStock` is zero.
 - **Response:** `restaurantId`, `rowsIngested`, `productsTracked`, `daysByProduct`, and
   `learnedLevels`. This is the RestoMind equivalent of the nightly native ingest.
@@ -220,18 +231,27 @@ use the learned per-restaurant level; until then they fall back to `avgDailySale
 - **Processing:** reads the restaurant registry and evaluates every tracked product's
   observed-day count and level source.
 - **Response:** product counts, `usingLearnedLevel`, the service-owned learning thresholds,
-  and `items` containing `productId`, title, `observedDays`, `levelSource`, and
-  `learnedLevel`. It does not change state.
+  and `items` containing `productId`, title, `observedDays`, `levelSource`,
+  `learnedLevel`, and `calendarAware`. It does not change state, and it returns no
+  predictions — `learnedLevel` is the product's ordinary-day level, which is the input to
+  a forecast rather than one. `calendarAware: false` means every date will get that same
+  flat level from the forecasting endpoints.
 
 #### `POST /integration/restomind/production-plan`
 
 - **Request:** `{ "restaurantId", "date", "products": [{ "productId", "title", "category?", "price?", "unitCost?", "freshnessWindow?", "avgDailySales?" }] }`.
 - **Processing:** converts product fields to the bridge model, persists product metadata,
-  reads each product's learned level when available, and produces a calendar-aware,
-  profit-aware daily recommendation.
+  reads each product's learned level when available, applies the restaurant's own learned
+  calendar for `date`, and produces a profit-aware daily recommendation. A product carrying
+  a trained catalogue `sku` bypasses all of that and is forecast by the trained model.
 - **Response:** `restaurantId`, `date`, `totalRecommendedQty`, and `items` with
-  `recommendedQty`, bounds, confidence, source, `levelSource`, base demand level, and
-  factors. It may update stored product metadata.
+  `recommendedQty`, bounds, confidence, source, `levelSource`, `baseDailyLevel`,
+  `calendarMultiplier`, and factors. It may update stored product metadata.
+- **Reading the quantity:** `recommendedQty ≈ baseDailyLevel × calendarMultiplier`, adjusted
+  within the ±10% band by the newsvendor service level when `unitCost` and `price` are both
+  known. `calendarMultiplier: 1.0` means the product has no learned calendar yet — it is on
+  the owner's `avgDailySales`, or its history is below the learning threshold — and every
+  date will therefore return the same quantity.
 
 #### `POST /integration/restomind/surplus-offers`
 

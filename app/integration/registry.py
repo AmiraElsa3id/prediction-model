@@ -39,6 +39,7 @@ import pandas as pd
 
 from app.core.egypt_calendar import CALENDAR
 from app.integration.restomind import ProductInput, predict_week
+from app.integration.tenant_calendar import TenantCalendar, fit_tenant_calendar
 
 if TYPE_CHECKING:
     from app.integration.mongo_store import RegistryStore
@@ -86,6 +87,10 @@ class RestaurantState:
     restaurant_id: str
     products: dict[str, ProductState] = field(default_factory=dict)
     history: pd.DataFrame | None = None
+    # Calendar effects learned from THIS restaurant's history, keyed by productId. The
+    # learned level is a quiet-day mean with seasonality deliberately excluded; this is
+    # what puts it back on the target date. `None` until some product earns a level.
+    calendar: TenantCalendar | None = None
 
     def upsert_products(self, products: list[ProductInput]) -> None:
         """Register or refresh products, MERGING rather than replacing.
@@ -114,7 +119,9 @@ class RestaurantState:
         `records` columns: date, productId, salesQty, and optionally productionQty /
         closingStock. The learned level is the mean of recent NON-EVENT, NON-STOCKOUT
         days, so the calendar multiplier re-adds Ramadan/Eid on top at predict time
-        rather than being baked into the level.
+        rather than being baked into the level. That multiplier is fitted here too --
+        see `tenant_calendar` -- from the same quiet-day sample, so the two always agree
+        about what an "ordinary day" for this product is.
         """
         records = records.copy()
         records["date"] = pd.to_datetime(records["date"])
@@ -138,6 +145,7 @@ class RestaurantState:
         # today) defaults to "not a stockout" -- the pre-existing behaviour.
         merged["is_stockout"] = merged["closingStock"].fillna(1) == 0
 
+        quiet_days: dict[str, list] = {}
         for pid, grp in merged.groupby("productId"):
             st = self.products.get(pid)
             if st is None:
@@ -150,11 +158,17 @@ class RestaurantState:
             ].sort_values("date").tail(QUIET_WINDOW)
             if len(quiet) >= MIN_DAYS_FOR_LEARNED:
                 st.learned_level = float(quiet["salesQty"].mean())
+                quiet_days[pid] = list(quiet["date"])
             elif st.learned_level is not None:
                 # Re-ingest re-evaluates every product: a level learned under an
                 # older, lower threshold drops back to the estimate until the
                 # product earns the new threshold again.
                 st.learned_level = None
+
+        # Refit rather than update: the levels above were just recomputed from the whole
+        # history, and a calendar normalised against a stale sample would no longer be
+        # 1.0 on an ordinary day -- which is the one property the caller relies on.
+        self.calendar = fit_tenant_calendar(self.history, quiet_days)
 
     def level_for(self, pid: str) -> tuple[float | None, str, str]:
         """`(level, mode, confidence)` for one product.
@@ -200,6 +214,9 @@ class RestaurantState:
                 if self.history is None
                 else [_history_row_to_dict(r) for r in self.history.to_dict("records")]
             ),
+            # Plain floats, never a pickled estimator: this document is read back at
+            # startup, and unpickling whatever is on that path is code execution.
+            "calendar": self.calendar.to_dict() if self.calendar else None,
         }
 
     @classmethod
@@ -216,6 +233,11 @@ class RestaurantState:
             hist = pd.DataFrame(rows)
             hist["date"] = pd.to_datetime(hist["date"])
             state.history = hist
+        # Absent on documents written before per-restaurant calendars existed; those
+        # restaurants stay on the flat level until their next ingest refits.
+        stored_calendar = raw.get("calendar")
+        if stored_calendar:
+            state.calendar = TenantCalendar.from_dict(stored_calendar)
         return state
 
 
@@ -343,6 +365,14 @@ class RestaurantRegistry:
     def get(self, restaurant_id: str) -> RestaurantState:
         return self._states.setdefault(restaurant_id, RestaurantState(restaurant_id))
 
+    def restaurant_ids(self) -> list[str]:
+        """Every restaurant currently loaded. For maintenance jobs that sweep the store.
+
+        `get()` creates on miss, so a caller that wants to visit what already exists --
+        rather than conjure empty state for a typo -- needs this rather than a guess.
+        """
+        return sorted(self._states)
+
     def upsert_products(self, restaurant_id: str, products: list[ProductInput]) -> None:
         """Register or refresh products for a restaurant, and persist the change.
 
@@ -393,7 +423,7 @@ class RestaurantRegistry:
         return predict_week(
             restaurant_id, product, week_start,
             promotion_active=promotion_active, level=level, mode=mode, confidence=confidence,
-            model=model,
+            model=model, calendar=state.calendar,
         )
 
     def status(self, restaurant_id: str) -> dict:
@@ -406,6 +436,9 @@ class RestaurantRegistry:
                 "observedDays": st.observed_days,
                 "levelSource": "learned_from_sales" if st.learned_level is not None else "owner_estimate",
                 "learnedLevel": round(st.learned_level, 1) if st.learned_level is not None else None,
+                # False means every date gets this same flat level. Without it the only
+                # way to discover that was to call the plan twice and compare.
+                "calendarAware": bool(state.calendar and pid in state.calendar),
             })
         return {
             "restaurantId": restaurant_id,

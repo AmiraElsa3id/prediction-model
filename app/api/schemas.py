@@ -344,7 +344,18 @@ class RMPlanItem(BaseModel):
     # Whether this quantity came from the restaurant's own sales or the owner's
     # estimate. Without it a plan cannot be told apart from a guess.
     levelSource: str = "owner_estimate"
-    baseDailyLevel: float = 0.0
+    baseDailyLevel: float = Field(
+        0.0, description="The product's ORDINARY-day level, before the calendar."
+    )
+    calendarMultiplier: float = Field(
+        1.0,
+        description="What this date does to that level, learned from this restaurant's "
+                    "own sales. Read it together with levelSource: on "
+                    "`learned_from_sales`/`owner_estimate` a 1.0 means no calendar has "
+                    "been learned for the product yet, so every date returns the same "
+                    "quantity. On `trained_model` it is always 1.0 because the trained "
+                    "model's calendar is already inside recommendedQty.",
+    )
     factors: list[Factor]
     # Present when the product has NO basis (no learned level, no owner estimate): the
     # bridge says so explicitly instead of inventing a quantity from priors.
